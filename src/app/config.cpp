@@ -15,6 +15,20 @@ Settings &settings()
     return g_settings;
 }
 
+namespace {
+char g_i2c_report[48] = "not scanned";
+}
+
+const char *i2cReport()
+{
+    return g_i2c_report;
+}
+
+void setI2cReport(const char *text)
+{
+    strlcpy(g_i2c_report, text, sizeof(g_i2c_report));
+}
+
 size_t radiusPresetIndex(uint16_t radius_nm)
 {
     for (size_t i = 0; i < kRadiusPresetCount; i++) {

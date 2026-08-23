@@ -7,6 +7,7 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <esp_heap_caps.h>
 
 #include "app/config.h"
 #include "model/aircraft.h"
@@ -251,7 +252,9 @@ void handleStatusApi()
     doc["address"] = g_address;
     doc["rssi"] = WiFi.RSSI();
     doc["free_sram"] = ESP.getFreeHeap();
+    doc["largest_sram_block"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     doc["free_psram"] = ESP.getFreePsram();
+    doc["i2c_devices"] = app::i2cReport();
 
     JsonObject home = doc["home"].to<JsonObject>();
     home["lat"] = settings.home_lat;
@@ -432,6 +435,11 @@ bool wifiBegin()
     g_server.on("/save", HTTP_POST, handleSave);
     g_server.on("/forget", HTTP_POST, handleForget);
     g_server.on("/api/status", HTTP_GET, handleStatusApi);
+    g_server.on("/reboot", HTTP_POST, []() {
+        g_server.send(200, "text/plain", "rebooting");
+        delay(300);
+        ESP.restart();
+    });
     // Captive-portal probes used by iOS, Android and Windows.
     g_server.on("/generate_204", HTTP_GET, handleNotFound);
     g_server.on("/hotspot-detect.html", HTTP_GET, handleNotFound);

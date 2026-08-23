@@ -10,9 +10,9 @@ namespace {
 
 // Draw buffers live in *internal* RAM: the RGB panel already saturates PSRAM
 // bandwidth streaming the framebuffer, and reading the flush source from PSRAM
-// too is what tears the left edge of the picture. 16 lines keeps the pair at
-// ~31 kB, which internal RAM can spare now that the feed uses plain HTTP.
-constexpr int kBufferLines = 16;
+// too is what tears the left edge of the picture. 10 lines keeps the pair at
+// ~19 kB — internal RAM has to leave ~40 kB contiguous free for a TLS session.
+constexpr int kBufferLines = 10;
 constexpr int kTaskCore = 1;          // UI on core 1, networking on core 0
 constexpr int kTaskPriority = 2;
 constexpr int kTaskStack = 8 * 1024;

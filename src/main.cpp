@@ -14,8 +14,10 @@
 #include "app/config.h"
 #include "model/aircraft.h"
 #include "net/adsb_client.h"
+#include "net/route_client.h"
 #include "net/wifi_manager.h"
 #include "ui/lvgl_port.h"
+#include "ui/radar_view.h"
 
 using namespace esp_panel::drivers;
 using namespace esp_panel::board;
@@ -57,6 +59,7 @@ lv_obj_t *g_stats_label = nullptr;
  */
 void scanI2C()
 {
+    char report[48] = "";
     Serial.print("[i2c] devices:");
     int found = 0;
     for (uint8_t address = 0x08; address < 0x78; address++) {
@@ -68,10 +71,14 @@ void scanI2C()
         i2c_cmd_link_delete(cmd);
         if (err == ESP_OK) {
             Serial.printf(" 0x%02X", address);
+            char one[8];
+            snprintf(one, sizeof(one), "%s0x%02X", found == 0 ? "" : " ", address);
+            strlcat(report, one, sizeof(report));
             found++;
         }
     }
     Serial.println(found == 0 ? " none!" : "");
+    app::setI2cReport(found == 0 ? "none" : report);
 }
 
 void logMemory(const char *stage)
@@ -277,7 +284,7 @@ void setup()
     {
         g_phase = "build-ui";
         ui::LvglGuard guard;
-        buildBringUpScreen();
+        ui::radarCreate();
     }
 
     g_phase = "store";
@@ -294,6 +301,9 @@ void setup()
     g_phase = "adsb";
     if (!net::adsbStart()) {
         Serial.println("[app] adsb task failed to start");
+    }
+    if (!net::routeStart()) {
+        Serial.println("[app] route lookup task failed to start");
     }
 
     g_phase = "running";

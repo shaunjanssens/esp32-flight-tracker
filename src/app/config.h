@@ -48,4 +48,8 @@ size_t radiusPresetIndex(uint16_t radius_nm);
 /** The process-wide settings instance. */
 Settings &settings();
 
+/** Devices found on I2C0 at boot, e.g. "0x15 0x20 0x51". */
+const char *i2cReport();
+void setI2cReport(const char *text);
+
 } // namespace app
