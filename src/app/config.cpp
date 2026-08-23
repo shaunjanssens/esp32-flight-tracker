@@ -63,9 +63,8 @@ bool Settings::load()
     night_end_hour = prefs.getUChar("night_end", night_end_hour);
     night_dimming = prefs.getBool("night_dim", night_dimming);
     imu_orientation = prefs.getBool("imu", imu_orientation);
-    bounce_lines = prefs.getUShort("bounce", bounce_lines);
+    refresh_ms = prefs.getUShort("refresh", refresh_ms);
     pclk_mhz = prefs.getUChar("pclk", pclk_mhz);
-    render_mode = prefs.getUChar("render", render_mode);
     prefs.getString("host", hostname, sizeof(hostname));
     prefs.getString("tz", timezone, sizeof(timezone));
     prefs.getString("ota_pw", ota_password, sizeof(ota_password));
@@ -94,9 +93,8 @@ bool Settings::save() const
     prefs.putUChar("night_end", night_end_hour);
     prefs.putBool("night_dim", night_dimming);
     prefs.putBool("imu", imu_orientation);
-    prefs.putUShort("bounce", bounce_lines);
+    prefs.putUShort("refresh", refresh_ms);
     prefs.putUChar("pclk", pclk_mhz);
-    prefs.putUChar("render", render_mode);
     prefs.putString("host", hostname);
     prefs.putString("tz", timezone);
     prefs.putString("ota_pw", ota_password);

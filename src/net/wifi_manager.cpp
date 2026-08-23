@@ -13,7 +13,11 @@
 #include "app/log.h"
 #include "model/aircraft.h"
 #include "net/adsb_client.h"
-#include "ui/lvgl_port.h"
+#include "hw/display.h"
+#include "ui/radar.h"
+
+/** Defined in main.cpp: arms a radios-off diagnostic boot. */
+void requestDiagnosticBoot(uint32_t seconds);
 
 namespace net {
 namespace {
@@ -102,32 +106,17 @@ void appendSettingsFields(String &html)
               "<input name=nend type=number min=0 max=23 value='");
     html += String(settings.night_end_hour);
     html += F("'></div></div>"
-              "<label>RGB bounce buffer (lines, 0 = off)</label>"
-              "<input name=bounce type=number min=0 max=40 value='");
-    html += String(settings.bounce_lines);
-    html += F("'><p class=hint>Changes take effect after a restart. 0 streams the "
-              "framebuffer straight from PSRAM; higher values buffer in SRAM but can "
-              "shift the picture when Wi-Fi writes to flash.</p>"
+              "'></div></div>"
+              "<label>Redraw period (ms)</label>"
+              "<input name=refresh type=number min=40 max=2000 value='");
+    html += String(settings.refresh_ms);
+    html += F("'><p class=hint>Every redraw composes and pushes a whole frame. "
+              "250 ms is 4 fps, which is smooth enough for aircraft.</p>"
               "<label>Pixel clock (MHz)</label>"
-              "<input name=pclk type=number min=6 max=24 value='");
+              "<input name=pclk type=number min=8 max=30 value='");
     html += String(settings.pclk_mhz);
-    html += F("'><p class=hint>16 is the panel default (~58 Hz). Lower frees PSRAM "
-              "bandwidth for drawing.</p>"
-              "<label>Rendering</label><select name=dbuf>");
-    for (uint8_t mode = 0; mode < 3; mode++) {
-        static const char *kNames[] = {"Partial flush", "Direct (VSYNC swap)",
-                                       "Full frame (single blit)"};
-        html += F("<option value=");
-        html += String(mode);
-        if (settings.render_mode == mode) {
-            html += F(" selected");
-        }
-        html += F(">");
-        html += kNames[mode];
-        html += F("</option>");
-    }
-    html += F("</select><p class=hint>Double buffering renders into the framebuffer the "
-              "panel is not showing, then swaps. Applies after a restart.</p></fieldset>");
+    html += F("'><p class=hint>Refresh rate is pclk/(548x499): 16 MHz is 58 Hz, 20 is "
+              "73 Hz, 24 is 88 Hz. Applied on restart.</p></fieldset>");
 }
 
 const char kGeoScript[] PROGMEM = R"JS(
@@ -239,15 +228,12 @@ void handleSave()
     if (g_server.hasArg("nstart")) {
         settings.night_start_hour = (uint8_t)constrain(g_server.arg("nstart").toInt(), 0, 23);
     }
-    if (g_server.hasArg("bounce")) {
-        settings.bounce_lines = (uint16_t)constrain(g_server.arg("bounce").toInt(), 0, 40);
-    }
-    if (g_server.hasArg("dbuf")) {
-        settings.render_mode = (uint8_t)constrain(g_server.arg("dbuf").toInt(), 0, 2);
-    }
     if (g_server.hasArg("pclk")) {
-        settings.pclk_mhz = (uint8_t)constrain(g_server.arg("pclk").toInt(), 6, 24);
-        ui::displaySetPixelClock(settings.pclk_mhz);
+        settings.pclk_mhz = (uint8_t)constrain(g_server.arg("pclk").toInt(), 8, 30);
+    }
+    if (g_server.hasArg("refresh")) {
+        settings.refresh_ms = (uint16_t)constrain(g_server.arg("refresh").toInt(), 40, 2000);
+        ui::radarSetRefreshMs(settings.refresh_ms);
     }
     if (g_server.hasArg("nend")) {
         settings.night_end_hour = (uint8_t)constrain(g_server.arg("nend").toInt(), 0, 23);
@@ -292,7 +278,6 @@ void handleStatusApi()
     doc["free_sram"] = ESP.getFreeHeap();
     doc["largest_sram_block"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     doc["free_psram"] = ESP.getFreePsram();
-    doc["render_mode"] = ui::displayRenderMode();
 
     JsonObject home = doc["home"].to<JsonObject>();
     home["lat"] = settings.home_lat;
@@ -474,22 +459,27 @@ bool wifiBegin()
     g_server.on("/save", HTTP_POST, handleSave);
     g_server.on("/forget", HTTP_POST, handleForget);
     g_server.on("/api/status", HTTP_GET, handleStatusApi);
-    // Live panel tuning: change the clock, look at the screen, decide. The
-    // value is only persisted once it is known to be good.
     g_server.on("/api/pclk", HTTP_POST, []() {
-        const uint32_t mhz = g_server.arg("mhz").toInt();
-        const bool ok = ui::displaySetPixelClock(mhz);
-        if (ok && g_server.arg("save") == "1") {
-            app::settings().pclk_mhz = (uint8_t)mhz;
-            app::settings().save();
-        }
-        g_server.send(ok ? 200 : 400, "text/plain",
-                      ok ? String("pixel clock now ") + mhz + " MHz"
-                         : String("rejected"));
+        const uint8_t mhz = (uint8_t)constrain(g_server.arg("mhz").toInt(), 8, 30);
+        app::settings().pclk_mhz = mhz;
+        app::settings().save();
+        g_server.send(200, "text/plain",
+                      String("pixel clock ") + mhz + " MHz on next boot, restarting");
+        delay(300);
+        ESP.restart();
     });
-    g_server.on("/api/resync", HTTP_POST, []() {
-        ui::displayResync();
-        g_server.send(200, "text/plain", "panel resynced");
+    g_server.on("/api/diag", HTTP_POST, []() {
+        const uint32_t seconds = (uint32_t)constrain(g_server.arg("seconds").toInt(), 5, 120);
+        ::requestDiagnosticBoot(seconds);
+        g_server.send(200, "text/plain",
+                      String("rebooting: static image, radios off for ") + seconds + "s");
+        delay(300);
+        ESP.restart();
+    });
+    g_server.on("/api/freeze", HTTP_POST, []() {
+        const bool freeze = g_server.arg("on") != "0";
+        ui::radarPause(freeze);
+        g_server.send(200, "text/plain", freeze ? "drawing paused" : "drawing resumed");
     });
     g_server.on("/api/log", HTTP_GET, []() {
         g_server.send(200, "text/plain", app::logDump());

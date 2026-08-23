@@ -32,38 +32,41 @@ struct Settings {
 
     bool imu_orientation = true;
 
+
+
+
     /**
-     * RGB bounce buffer height in lines; 0 disables it.
+     * Radar redraw period in ms.
      *
-     * Not cosmetic: with a bounce buffer the LCD FIFO is refilled from an
-     * interrupt, and these Arduino IDF libraries are built with
-     * CONFIG_LCD_RGB_ISR_IRAM_SAFE off, so any flash write (Wi-Fi writing PHY
-     * calibration to NVS, for one) can starve it and shift the picture for
-     * good. Without one, GDMA streams straight from PSRAM instead. Which is
-     * better depends on the board, so it is a setting, applied at boot.
+     * Each redraw blits the whole 480x480 frame, so this is the single
+     * biggest lever on how much the panel is disturbed. It buys almost
+     * nothing visually: an airliner at 500 kt crosses a 25 nm face in about
+     * three minutes, roughly 2 px per second, so even 4 fps moves a blip half
+     * a pixel per frame.
      */
-    uint16_t bounce_lines = 0;
+    uint16_t refresh_ms = 250;
 
     /**
-     * RGB pixel clock in MHz (board default 16). At 480x480 with the porches
-     * this board uses, 16 MHz is ~58 Hz refresh and 27.6 MB/s of continuous
-     * PSRAM reads. Dropping it trades refresh rate for bandwidth headroom,
-     * which is the other half of the tearing story.
+     * RGB pixel clock in MHz, applied when the panel is initialised.
+     *
+     * This is the one setting that actually decides whether the picture is
+     * stable, and the default is low on purpose.
+     *
+     * The panel reads its framebuffer out of PSRAM continuously: 480 x 480 x 2
+     * bytes per frame, so bandwidth = pclk x 2 x 480x480 / (548 x 499), which
+     * is 27.6 MB/s at 16 MHz and 34 MB/s at 20 MHz. Measured throughput on
+     * this board is 34 MB/s write and 22 MB/s copy, so at 16 MHz the refresh
+     * alone consumes the whole memory system and anything else - Wi-Fi DMA,
+     * our own drawing - starves it and the image tears. 8 MHz needs 13.8 MB/s
+     * and is rock steady with Wi-Fi up and aircraft moving.
+     *
+     * The cost is refresh rate (8 MHz is ~29 Hz), which on an LCD shows as
+     * slightly less crisp motion rather than the brightness flicker a CRT
+     * would give. Raise it if your board has bandwidth to spare; verify with
+     * Wi-Fi connected and aircraft on screen, since an idle device looks fine
+     * at any clock.
      */
-    uint8_t pclk_mhz = 16;
-
-    /**
-     * How LVGL gets pixels onto the panel. All three exist because RGB panels
-     * on this SoC fail in different ways and the only honest test is the
-     * screen itself:
-     *   0 Partial - small buffers copied into the live framebuffer. Cheapest
-     *     in RAM, but writes memory the panel is scanning out: tears.
-     *   1 Direct  - LVGL renders into the panel's own second framebuffer and
-     *     they swap on VSYNC.
-     *   2 Full    - the whole frame is composed off-screen in PSRAM and blitted
-     *     in a single pass. What the LovyanGFX projects on this board do.
-     */
-    uint8_t render_mode = 2;
+    uint8_t pclk_mhz = 8;
 
     char hostname[24] = "flighttracker";
     char timezone[40] = "CET-1CEST,M3.5.0,M10.5.0/3";   // Europe/Brussels
