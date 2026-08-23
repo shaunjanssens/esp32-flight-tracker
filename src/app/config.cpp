@@ -10,23 +10,28 @@ Settings g_settings;
 
 } // namespace
 
+namespace {
+constexpr uint32_t kSaveDelayMs = 4000;
+uint32_t g_save_due_ms = 0;
+} // namespace
+
 Settings &settings()
 {
     return g_settings;
 }
 
-namespace {
-char g_i2c_report[48] = "not scanned";
+void Settings::saveSoon()
+{
+    g_save_due_ms = millis() + kSaveDelayMs;
 }
 
-const char *i2cReport()
+void settingsTick()
 {
-    return g_i2c_report;
-}
-
-void setI2cReport(const char *text)
-{
-    strlcpy(g_i2c_report, text, sizeof(g_i2c_report));
+    if (g_save_due_ms == 0 || (int32_t)(millis() - g_save_due_ms) < 0) {
+        return;
+    }
+    g_save_due_ms = 0;
+    g_settings.save();
 }
 
 size_t radiusPresetIndex(uint16_t radius_nm)
@@ -58,6 +63,9 @@ bool Settings::load()
     night_end_hour = prefs.getUChar("night_end", night_end_hour);
     night_dimming = prefs.getBool("night_dim", night_dimming);
     imu_orientation = prefs.getBool("imu", imu_orientation);
+    bounce_lines = prefs.getUShort("bounce", bounce_lines);
+    pclk_mhz = prefs.getUChar("pclk", pclk_mhz);
+    render_mode = prefs.getUChar("render", render_mode);
     prefs.getString("host", hostname, sizeof(hostname));
     prefs.getString("tz", timezone, sizeof(timezone));
     prefs.getString("ota_pw", ota_password, sizeof(ota_password));
@@ -86,6 +94,9 @@ bool Settings::save() const
     prefs.putUChar("night_end", night_end_hour);
     prefs.putBool("night_dim", night_dimming);
     prefs.putBool("imu", imu_orientation);
+    prefs.putUShort("bounce", bounce_lines);
+    prefs.putUChar("pclk", pclk_mhz);
+    prefs.putUChar("render", render_mode);
     prefs.putString("host", hostname);
     prefs.putString("tz", timezone);
     prefs.putString("ota_pw", ota_password);

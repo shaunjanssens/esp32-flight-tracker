@@ -8,16 +8,21 @@
 #include <math.h>
 
 #include "app/config.h"
+#include "app/log.h"
 #include "model/aircraft.h"
 
 namespace net {
 namespace {
 
 constexpr uint32_t kPollIntervalMs = 5000;
-constexpr uint32_t kMinIntervalMs  = 4000;    // never hammer the feed harder than this
+constexpr uint32_t kMinGapMs       = 2500;    // hard floor between requests, whatever asks
+constexpr uint32_t kRateLimitMs    = 60000;   // stand down this long after an HTTP 429
 constexpr uint32_t kBackoffMaxMs   = 120000;
-constexpr uint32_t kHttpTimeoutMs  = 15000;
+constexpr uint32_t kHttpTimeoutMs  = 20000;   // whole-response budget
+constexpr uint32_t kConnectTimeoutMs = 5000;  // a healthy node answers in well under a second
 constexpr size_t   kMaxRecords     = 512;     // dst scratch, bigger than any 100 nm response
+constexpr size_t   kBodyCapacity   = 192 * 1024;  // 100 nm returns ~150 kB
+constexpr uint32_t kStallTimeoutMs = 6000;
 constexpr int      kTaskCore       = 0;
 constexpr int      kTaskPriority   = 3;
 constexpr int      kTaskStack      = 10 * 1024;
@@ -26,9 +31,12 @@ const char kUserAgent[] =
     "esp32-flight-tracker/0.1 (+https://github.com/shaunjanssens/esp32-flight-tracker)";
 
 FeedStats g_stats;
+uint32_t g_last_request_ms = 0;
+uint32_t g_rate_limited_until_ms = 0;
 portMUX_TYPE g_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 TaskHandle_t g_task = nullptr;
 float *g_distances = nullptr;
+char  *g_body = nullptr;
 
 /** ArduinoJson allocator that keeps the parsed document out of internal RAM. */
 struct PsramAllocator : ArduinoJson::Allocator {
@@ -74,7 +82,7 @@ constexpr size_t kProviderCount = sizeof(kProviders) / sizeof(kProviders[0]);
 // after a failover.
 size_t g_active_provider = 0;
 uint32_t g_consecutive_failures = 0;
-constexpr uint32_t kFailoverAfter = 3;
+constexpr uint32_t kFailoverAfter = 2;
 
 void buildUrl(char *out, size_t out_size)
 {
@@ -91,8 +99,8 @@ void considerFailover()
     }
     g_active_provider = (g_active_provider + 1) % kProviderCount;
     g_consecutive_failures = 0;
-    Serial.printf("[adsb] switching to %s after %u failures\n",
-                  kProviders[g_active_provider].name, (unsigned)kFailoverAfter);
+    app::logf("[adsb] switching to %s after %u consecutive failures",
+              kProviders[g_active_provider].name, (unsigned)kFailoverAfter);
 }
 
 void configureTls(WiFiClientSecure &client)
@@ -216,11 +224,42 @@ void applyRecord(model::Aircraft &aircraft, JsonObjectConst record, uint32_t now
     aircraft.last_update_ms = now_ms;
 }
 
-bool fetchOnce()
+/**
+ * These feeds are volunteer-funded and shared. A poll every 5 s is fine; a
+ * burst is not, and the range gesture can ask for a refresh on every step.
+ * This is the one place that decides whether a request actually goes out.
+ */
+bool requestAllowed()
 {
-    if (WiFi.status() != WL_CONNECTED) {
+    const uint32_t now = millis();
+    if (g_rate_limited_until_ms != 0 && (int32_t)(now - g_rate_limited_until_ms) < 0) {
         return false;
     }
+    if (g_last_request_ms != 0 && (now - g_last_request_ms) < kMinGapMs) {
+        return false;
+    }
+    return true;
+}
+
+/** Big radii mean big responses; ask for them less often. */
+uint32_t pollIntervalMs()
+{
+    const uint16_t radius = app::settings().radius_nm;
+    if (radius >= 100) {
+        return 20000;      // ~150 kB a go: four times a minute is plenty
+    }
+    if (radius >= 50) {
+        return 10000;
+    }
+    return kPollIntervalMs;
+}
+
+bool fetchOnce()
+{
+    if (WiFi.status() != WL_CONNECTED || !requestAllowed()) {
+        return false;
+    }
+    g_last_request_ms = millis();
 
     char url[160];
     buildUrl(url, sizeof(url));
@@ -236,10 +275,13 @@ bool fetchOnce()
     HTTPClient http;
     http.setUserAgent(kUserAgent);
     http.setTimeout(kHttpTimeoutMs);
-    http.setConnectTimeout(kHttpTimeoutMs);
+    // Short: adsb.lol publishes five A records and some of them refuse
+    // connections. Discovering that must be quick, because the cost is paid
+    // before every failover.
+    http.setConnectTimeout(kConnectTimeoutMs);
     http.useHTTP10(true);              // stream the body instead of chunk-decoding it
     if (!http.begin(client, url)) {
-        Serial.printf("[adsb] %s: connection setup failed\n", provider.name);
+        app::logf("[adsb] %s: connection setup failed", provider.name);
         portENTER_CRITICAL(&g_stats_mux);
         g_stats.failure_count++;
         portEXIT_CRITICAL(&g_stats_mux);
@@ -248,9 +290,28 @@ bool fetchOnce()
 
     const uint32_t started_ms = millis();
     const int status = http.GET();
+    if (status == HTTP_CODE_TOO_MANY_REQUESTS) {
+        g_rate_limited_until_ms = millis() + kRateLimitMs;
+        app::logf("[adsb] %s: rate limited (429), standing down %us",
+                  provider.name, (unsigned)(kRateLimitMs / 1000));
+        http.end();
+        portENTER_CRITICAL(&g_stats_mux);
+        g_stats.last_http_code = status;
+        g_stats.failure_count++;
+        portEXIT_CRITICAL(&g_stats_mux);
+        return false;
+    }
+
     if (status != HTTP_CODE_OK) {
-        Serial.printf("[adsb] %s: HTTP %d (%s)\n", provider.name, status,
-                      HTTPClient::errorToString(status).c_str());
+        // -1 covers everything from a refused connection to a failed DNS
+        // lookup, so resolve the host separately to tell them apart.
+        IPAddress resolved;
+        const bool dns_ok = WiFi.hostByName(provider.tls ? "opendata.adsb.fi" : "api.adsb.lol",
+                                            resolved);
+        app::logf("[adsb] %s: HTTP %d (%s) dns=%s gw=%s rssi=%d", provider.name, status,
+                  HTTPClient::errorToString(status).c_str(),
+                  dns_ok ? resolved.toString().c_str() : "FAILED",
+                  WiFi.gatewayIP().toString().c_str(), (int)WiFi.RSSI());
         http.end();
         portENTER_CRITICAL(&g_stats_mux);
         g_stats.last_http_code = status;
@@ -261,16 +322,57 @@ bool fetchOnce()
 
     const int content_length = http.getSize();
 
+    // Read the whole body into PSRAM before parsing.
+    //
+    // Parsing straight from the socket is tempting and was the first cut, but
+    // ArduinoJson treats a read that returns nothing as end-of-input: one pause
+    // longer than the stream timeout - routine on TLS over marginal Wi-Fi -
+    // ends the document early and the parse fails with IncompleteInput. Here a
+    // stall is just a stall, and only a real close or a long silence ends it.
+    WiFiClient *stream = http.getStreamPtr();
+    size_t received = 0;
+    uint32_t last_data_ms = millis();
+    while (received + 1 < kBodyCapacity) {
+        const size_t available = stream->available();
+        if (available > 0) {
+            const size_t room = kBodyCapacity - received - 1;
+            const int read = stream->readBytes(g_body + received,
+                                               available < room ? available : room);
+            if (read > 0) {
+                received += (size_t)read;
+                last_data_ms = millis();
+            }
+        } else {
+            if (content_length > 0 && received >= (size_t)content_length) {
+                break;                       // whole body in hand
+            }
+            if (!http.connected() && stream->available() == 0) {
+                break;                       // server closed, HTTP/1.0 style
+            }
+            if (millis() - last_data_ms > kStallTimeoutMs) {
+                app::logf("[adsb] %s: stalled after %u of %d bytes",
+                          provider.name, (unsigned)received, content_length);
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+    g_body[received] = '\0';
+    http.end();
+
     JsonDocument filter;
     buildFilter(filter);
 
     JsonDocument doc(&g_allocator);
     const DeserializationError error =
-        deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
-    http.end();
+        deserializeJson(doc, g_body, received, DeserializationOption::Filter(filter));
 
     if (error) {
-        Serial.printf("[adsb] parse failed: %s\n", error.c_str());
+        // IncompleteInput means the body stopped arriving mid-JSON, which on a
+        // marginal link happens to a 14 kB response often enough to matter.
+        // Report it distinctly from malformed JSON so the log stays honest.
+        app::logf("[adsb] %s: parse failed after %u of %d bytes: %s",
+                  provider.name, (unsigned)received, content_length, error.c_str());
         portENTER_CRITICAL(&g_stats_mux);
         g_stats.failure_count++;
         portEXIT_CRITICAL(&g_stats_mux);
@@ -279,7 +381,7 @@ bool fetchOnce()
 
     JsonArrayConst array = aircraftArray(doc);
     if (array.isNull()) {
-        Serial.printf("[adsb] %s: response has no aircraft array\n", provider.name);
+        app::logf("[adsb] %s: response has no aircraft array", provider.name);
         portENTER_CRITICAL(&g_stats_mux);
         g_stats.failure_count++;
         portEXIT_CRITICAL(&g_stats_mux);
@@ -322,13 +424,13 @@ bool fetchOnce()
     g_stats.reported_total = total;
     g_stats.accepted = accepted;
     g_stats.last_http_code = status;
-    g_stats.last_bytes = content_length > 0 ? (uint32_t)content_length : 0;
+    g_stats.last_bytes = (uint32_t)received;
     g_stats.last_duration_ms = now_ms - started_ms;
     portEXIT_CRITICAL(&g_stats_mux);
 
-    Serial.printf("[adsb] %s: %u/%u aircraft, %d bytes, %ums\n",
-                  provider.name, (unsigned)accepted, (unsigned)total, content_length,
-                  (unsigned)(now_ms - started_ms));
+    app::logf("[adsb] %s: %u/%u aircraft, %u bytes, %ums",
+              provider.name, (unsigned)accepted, (unsigned)total, (unsigned)received,
+              (unsigned)(now_ms - started_ms));
     return true;
 }
 
@@ -351,7 +453,14 @@ void adsbTask(void *)
             g_consecutive_failures = 0;
         }
 
-        const bool ok = app::settings().position_set && fetchOnce();
+        bool ok = app::settings().position_set && fetchOnce();
+        if (!ok && app::settings().position_set && g_rate_limited_until_ms == 0) {
+            // A truncated body or a dropped connection is usually transient;
+            // one prompt retry beats waiting out the whole poll interval. Never
+            // retry into a rate limit, though - that is how you earn a longer one.
+            vTaskDelay(pdMS_TO_TICKS(kMinGapMs));
+            ok = fetchOnce();
+        }
         if (ok) {
             g_consecutive_failures = 0;
         } else {
@@ -362,8 +471,11 @@ void adsbTask(void *)
                                                : min(backoff_ms * 2, kBackoffMaxMs));
 
         const uint32_t elapsed = millis() - started;
-        uint32_t wait_ms = kPollIntervalMs + backoff_ms;
-        wait_ms = (wait_ms > elapsed) ? wait_ms - elapsed : kMinIntervalMs;
+        uint32_t wait_ms = pollIntervalMs() + backoff_ms;
+        if (g_rate_limited_until_ms != 0 && (int32_t)(millis() - g_rate_limited_until_ms) < 0) {
+            wait_ms = g_rate_limited_until_ms - millis();
+        }
+        wait_ms = (wait_ms > elapsed) ? wait_ms - elapsed : kMinGapMs;
 
         // A refresh request (radius change) cuts the wait short.
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_ms));
@@ -377,12 +489,30 @@ bool adsbStart()
     if (g_task != nullptr) {
         return true;
     }
+    if (g_body == nullptr) {
+        g_body = (char *)heap_caps_malloc(kBodyCapacity, MALLOC_CAP_SPIRAM);
+        if (g_body == nullptr) {
+            return false;
+        }
+    }
     if (g_distances == nullptr) {
         g_distances = (float *)heap_caps_malloc(kMaxRecords * sizeof(float), MALLOC_CAP_SPIRAM);
-        if (g_distances == nullptr) {
+        if (g_body == nullptr) {
+        g_body = (char *)heap_caps_malloc(kBodyCapacity, MALLOC_CAP_SPIRAM);
+        if (g_body == nullptr) {
+            return false;
+        }
+    }
+    if (g_distances == nullptr) {
             g_distances = (float *)malloc(kMaxRecords * sizeof(float));
         }
-        if (g_distances == nullptr) {
+        if (g_body == nullptr) {
+        g_body = (char *)heap_caps_malloc(kBodyCapacity, MALLOC_CAP_SPIRAM);
+        if (g_body == nullptr) {
+            return false;
+        }
+    }
+    if (g_distances == nullptr) {
             return false;
         }
     }

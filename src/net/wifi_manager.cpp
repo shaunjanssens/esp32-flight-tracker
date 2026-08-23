@@ -10,8 +10,10 @@
 #include <esp_heap_caps.h>
 
 #include "app/config.h"
+#include "app/log.h"
 #include "model/aircraft.h"
 #include "net/adsb_client.h"
+#include "ui/lvgl_port.h"
 
 namespace net {
 namespace {
@@ -99,7 +101,33 @@ void appendSettingsFields(String &html)
     html += F("'></div><div><label>Night until (h)</label>"
               "<input name=nend type=number min=0 max=23 value='");
     html += String(settings.night_end_hour);
-    html += F("'></div></div></fieldset>");
+    html += F("'></div></div>"
+              "<label>RGB bounce buffer (lines, 0 = off)</label>"
+              "<input name=bounce type=number min=0 max=40 value='");
+    html += String(settings.bounce_lines);
+    html += F("'><p class=hint>Changes take effect after a restart. 0 streams the "
+              "framebuffer straight from PSRAM; higher values buffer in SRAM but can "
+              "shift the picture when Wi-Fi writes to flash.</p>"
+              "<label>Pixel clock (MHz)</label>"
+              "<input name=pclk type=number min=6 max=24 value='");
+    html += String(settings.pclk_mhz);
+    html += F("'><p class=hint>16 is the panel default (~58 Hz). Lower frees PSRAM "
+              "bandwidth for drawing.</p>"
+              "<label>Rendering</label><select name=dbuf>");
+    for (uint8_t mode = 0; mode < 3; mode++) {
+        static const char *kNames[] = {"Partial flush", "Direct (VSYNC swap)",
+                                       "Full frame (single blit)"};
+        html += F("<option value=");
+        html += String(mode);
+        if (settings.render_mode == mode) {
+            html += F(" selected");
+        }
+        html += F(">");
+        html += kNames[mode];
+        html += F("</option>");
+    }
+    html += F("</select><p class=hint>Double buffering renders into the framebuffer the "
+              "panel is not showing, then swaps. Applies after a restart.</p></fieldset>");
 }
 
 const char kGeoScript[] PROGMEM = R"JS(
@@ -211,6 +239,16 @@ void handleSave()
     if (g_server.hasArg("nstart")) {
         settings.night_start_hour = (uint8_t)constrain(g_server.arg("nstart").toInt(), 0, 23);
     }
+    if (g_server.hasArg("bounce")) {
+        settings.bounce_lines = (uint16_t)constrain(g_server.arg("bounce").toInt(), 0, 40);
+    }
+    if (g_server.hasArg("dbuf")) {
+        settings.render_mode = (uint8_t)constrain(g_server.arg("dbuf").toInt(), 0, 2);
+    }
+    if (g_server.hasArg("pclk")) {
+        settings.pclk_mhz = (uint8_t)constrain(g_server.arg("pclk").toInt(), 6, 24);
+        ui::displaySetPixelClock(settings.pclk_mhz);
+    }
     if (g_server.hasArg("nend")) {
         settings.night_end_hour = (uint8_t)constrain(g_server.arg("nend").toInt(), 0, 23);
     }
@@ -254,7 +292,7 @@ void handleStatusApi()
     doc["free_sram"] = ESP.getFreeHeap();
     doc["largest_sram_block"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     doc["free_psram"] = ESP.getFreePsram();
-    doc["i2c_devices"] = app::i2cReport();
+    doc["render_mode"] = ui::displayRenderMode();
 
     JsonObject home = doc["home"].to<JsonObject>();
     home["lat"] = settings.home_lat;
@@ -329,7 +367,7 @@ void startPortal()
     strlcpy(g_network, ap_name, sizeof(g_network));
     strlcpy(g_address, WiFi.softAPIP().toString().c_str(), sizeof(g_address));
 
-    Serial.printf("[wifi] setup portal up: %s -> http://%s/\n", ap_name, g_address);
+    app::logf("[wifi] setup portal up: %s -> http://%s/", ap_name, g_address);
 }
 
 void startOta()
@@ -363,7 +401,7 @@ bool connectStation()
         return false;
     }
 
-    Serial.printf("[wifi] connecting to %s\n", ssid.c_str());
+    app::logf("[wifi] connecting to %s", ssid.c_str());
     g_state = WifiState::Connecting;
     strlcpy(g_network, ssid.c_str(), sizeof(g_network));
 
@@ -377,13 +415,13 @@ bool connectStation()
         delay(250);
     }
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[wifi] connection failed");
+        app::logf("[wifi] connection failed");
         return false;
     }
 
     strlcpy(g_address, WiFi.localIP().toString().c_str(), sizeof(g_address));
     g_state = WifiState::Connected;
-    Serial.printf("[wifi] connected, http://%s/ (%s.local)\n", g_address, app::settings().hostname);
+    app::logf("[wifi] connected, http://%s/ (%s.local)", g_address, app::settings().hostname);
 
     if (MDNS.begin(app::settings().hostname)) {
         MDNS.addService("http", "tcp", 80);
@@ -407,14 +445,15 @@ void networkTask(void *)
         // Rejoin if the access point goes away.
         if (!g_portal && g_state == WifiState::Connected && WiFi.status() != WL_CONNECTED) {
             g_state = WifiState::Connecting;
-            Serial.println("[wifi] link lost, reconnecting");
+            app::logf("[wifi] link lost, reconnecting");
             WiFi.reconnect();
         } else if (!g_portal && g_state == WifiState::Connecting && WiFi.status() == WL_CONNECTED) {
             strlcpy(g_address, WiFi.localIP().toString().c_str(), sizeof(g_address));
             g_state = WifiState::Connected;
-            Serial.printf("[wifi] reconnected: %s\n", g_address);
+            app::logf("[wifi] reconnected: %s", g_address);
         }
 
+        app::settingsTick();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -435,6 +474,26 @@ bool wifiBegin()
     g_server.on("/save", HTTP_POST, handleSave);
     g_server.on("/forget", HTTP_POST, handleForget);
     g_server.on("/api/status", HTTP_GET, handleStatusApi);
+    // Live panel tuning: change the clock, look at the screen, decide. The
+    // value is only persisted once it is known to be good.
+    g_server.on("/api/pclk", HTTP_POST, []() {
+        const uint32_t mhz = g_server.arg("mhz").toInt();
+        const bool ok = ui::displaySetPixelClock(mhz);
+        if (ok && g_server.arg("save") == "1") {
+            app::settings().pclk_mhz = (uint8_t)mhz;
+            app::settings().save();
+        }
+        g_server.send(ok ? 200 : 400, "text/plain",
+                      ok ? String("pixel clock now ") + mhz + " MHz"
+                         : String("rejected"));
+    });
+    g_server.on("/api/resync", HTTP_POST, []() {
+        ui::displayResync();
+        g_server.send(200, "text/plain", "panel resynced");
+    });
+    g_server.on("/api/log", HTTP_GET, []() {
+        g_server.send(200, "text/plain", app::logDump());
+    });
     g_server.on("/reboot", HTTP_POST, []() {
         g_server.send(200, "text/plain", "rebooting");
         delay(300);

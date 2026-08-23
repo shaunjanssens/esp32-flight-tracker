@@ -4,10 +4,12 @@
 #include <time.h>
 
 #include "app/config.h"
+#include "app/log.h"
 #include "model/aircraft.h"
 #include "net/adsb_client.h"
 #include "net/wifi_manager.h"
 #include "ui/detail_sheet.h"
+#include "ui/lvgl_port.h"
 
 namespace ui {
 namespace {
@@ -386,10 +388,11 @@ void changeRange(int direction)
         return;
     }
     settings.radius_nm = app::kRadiusPresets[next];
-    settings.save();
+    settings.save();          // writes NVS, which stalls the panel's PSRAM reads
+    displayResync();
     net::adsbRefreshNow();
     g_range_hint_until = millis() + 1500;
-    Serial.printf("[ui] range %u nm\n", (unsigned)settings.radius_nm);
+    app::logf("[ui] range %u nm", (unsigned)settings.radius_nm);
 }
 
 void onPressed(lv_event_t *event)

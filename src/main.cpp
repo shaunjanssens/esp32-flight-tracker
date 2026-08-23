@@ -7,11 +7,13 @@
 
 #include <Arduino.h>
 #include <esp_display_panel.hpp>
-#include <driver/i2c.h>
 #include <esp_heap_caps.h>
+#include <esp_lcd_panel_rgb.h>
+#include <esp_system.h>
 #include <lvgl.h>
 
 #include "app/config.h"
+#include "app/log.h"
 #include "model/aircraft.h"
 #include "net/adsb_client.h"
 #include "net/route_client.h"
@@ -33,6 +35,20 @@ Board *g_board = nullptr;
  */
 volatile const char *g_phase = "start";
 
+/**
+ * Counts display-init attempts across soft resets. Kept in RTC memory rather
+ * than NVS so that counting costs no flash write - and because a power cycle
+ * clearing it is exactly the behaviour we want.
+ *
+ * If bringing the panel up crashes twice in a row, the third boot skips the
+ * display entirely and stays on the network, where it can be fixed by OTA.
+ * Without this, one bad display setting means the USB cable and the BOOT
+ * button, which on this board is a genuinely painful loop.
+ */
+RTC_NOINIT_ATTR uint32_t g_display_attempts;
+constexpr uint32_t kDisplayAttemptLimit = 2;
+bool g_headless = false;
+
 void heartbeatTask(void *)
 {
     while (true) {
@@ -46,40 +62,6 @@ void heartbeatTask(void *)
 lv_obj_t *g_sweep = nullptr;
 lv_obj_t *g_touch_dot = nullptr;
 lv_obj_t *g_stats_label = nullptr;
-
-/**
- * Probe I2C0 (SCL 7 / SDA 15), which the touch controller, the IO expander and
- * the RTC share, to see which chips this board revision actually carries.
- *
- * This deliberately uses the *legacy* driver/i2c.h API. ESP32_IO_Expander links
- * the legacy driver, and IDF registers a global constructor that aborts the
- * whole firmware at startup if the new i2c_master driver is linked alongside it
- * ("CONFLICT! driver_ng is not allowed to be used with this old driver").
- * Must be called after Board::init() has configured the bus.
- */
-void scanI2C()
-{
-    char report[48] = "";
-    Serial.print("[i2c] devices:");
-    int found = 0;
-    for (uint8_t address = 0x08; address < 0x78; address++) {
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, (address << 1) | I2C_MASTER_WRITE, true);
-        i2c_master_stop(cmd);
-        const esp_err_t err = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(50));
-        i2c_cmd_link_delete(cmd);
-        if (err == ESP_OK) {
-            Serial.printf(" 0x%02X", address);
-            char one[8];
-            snprintf(one, sizeof(one), "%s0x%02X", found == 0 ? "" : " ", address);
-            strlcat(report, one, sizeof(report));
-            found++;
-        }
-    }
-    Serial.println(found == 0 ? " none!" : "");
-    app::setI2cReport(found == 0 ? "none" : report);
-}
 
 void logMemory(const char *stage)
 {
@@ -239,53 +221,12 @@ void setup()
     xTaskCreatePinnedToCore(heartbeatTask, "heartbeat", 4096, nullptr, 1, nullptr, 0);
     logMemory("boot");
 
-    g_phase = "board-init";
-
-    g_board = new Board();
-    if (!g_board->init()) {
-        Serial.println("[board] init failed");
-        return;
-    }
-
-    g_phase = "i2c-scan";
-    scanI2C();
-
-    // An RGB panel streams its framebuffer out of PSRAM continuously; Wi-Fi and
-    // TLS compete for that same bandwidth and the picture shears. Bounce buffers
-    // in internal SRAM are what keep the image stable under network load.
-    LCD *lcd = g_board->getLCD();
-    if (lcd != nullptr) {
-        Bus *bus = lcd->getBus();
-        if (bus != nullptr && bus->getBasicAttributes().type == ESP_PANEL_BUS_TYPE_RGB) {
-            static_cast<BusRGB *>(bus)->configRGB_BounceBufferSize(lcd->getFrameWidth() * 20);
-            Serial.println("[board] RGB bounce buffer: 20 lines");
-        }
-    }
-
-    g_phase = "board-begin";
-    if (!g_board->begin()) {
-        Serial.println("[board] begin failed");
-        return;
-    }
-    logMemory("panel");
-
-    Backlight *backlight = g_board->getBacklight();
-    if (backlight != nullptr) {
-        backlight->setBrightness(100);
-    }
-
-    g_phase = "lvgl-init";
-    if (!ui::lvglPortInit(g_board->getLCD(), g_board->getTouch())) {
-        Serial.println("[lvgl] port init failed");
-        return;
-    }
-    logMemory("lvgl");
-
-    {
-        g_phase = "build-ui";
-        ui::LvglGuard guard;
-        ui::radarCreate();
-    }
+    // Settings and networking come first, and nothing below is allowed to
+    // return early. A device whose panel fails to start must still join Wi-Fi
+    // and accept an OTA update - otherwise a display bug strands it, and the
+    // only way back in is the USB cable and the BOOT button.
+    g_phase = "settings";
+    app::settings().load();
 
     g_phase = "store";
     if (!model::store().begin()) {
@@ -293,7 +234,6 @@ void setup()
     }
 
     g_phase = "wifi";
-    app::settings().load();
     if (!net::wifiBegin()) {
         Serial.println("[app] wifi task failed to start");
     }
@@ -305,6 +245,85 @@ void setup()
     if (!net::routeStart()) {
         Serial.println("[app] route lookup task failed to start");
     }
+
+    if (esp_reset_reason() == ESP_RST_POWERON) {
+        g_display_attempts = 0;
+    }
+    if (g_display_attempts >= kDisplayAttemptLimit) {
+        g_headless = true;
+        g_phase = "headless";
+        app::logf("[board] display init crashed %u times - staying headless, OTA is open",
+                  (unsigned)g_display_attempts);
+        return;
+    }
+    g_display_attempts++;
+
+    g_phase = "board-init";
+    g_board = new Board();
+    if (!g_board->init()) {
+        Serial.println("[board] init failed - continuing headless");
+        return;
+    }
+
+    const uint16_t bounce_lines = app::settings().bounce_lines;
+    LCD *lcd = g_board->getLCD();
+    if (lcd != nullptr) {
+        Bus *bus = lcd->getBus();
+        if (bus != nullptr && bus->getBasicAttributes().type == ESP_PANEL_BUS_TYPE_RGB) {
+            // Two framebuffers so LVGL can render into the one that is not
+            // being scanned out (see the port's direct mode).
+            if (app::settings().render_mode == (uint8_t)ui::RenderMode::Direct) {
+                lcd->configFrameBufferNumber(2);
+            }
+            auto *rgb_bus = static_cast<BusRGB *>(bus);
+            if (bounce_lines > 0) {
+                rgb_bus->configRGB_BounceBufferSize(lcd->getFrameWidth() * bounce_lines);
+            } else {
+                // configRGB_BounceBufferSize(0) divides by the size to align it,
+                // so it traps on zero. Clear the field in the panel config
+                // instead, which is what "no bounce buffer" actually means.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+                auto *config = const_cast<esp_lcd_rgb_panel_config_t *>(rgb_bus->getRgbConfig());
+#pragma GCC diagnostic pop
+                config->bounce_buffer_size_px = 0;
+            }
+            Serial.printf("[board] RGB bounce buffer: %u lines\n", (unsigned)bounce_lines);
+        }
+    }
+
+    g_phase = "board-begin";
+    if (!g_board->begin()) {
+        Serial.println("[board] begin failed - continuing headless");
+        return;
+    }
+    logMemory("panel");
+
+    Backlight *backlight = g_board->getBacklight();
+    if (backlight != nullptr) {
+        backlight->setBrightness(app::settings().day_brightness);
+    }
+
+    g_phase = "lvgl-init";
+    if (!ui::lvglPortInit(g_board->getLCD(), g_board->getTouch(),
+                          (ui::RenderMode)app::settings().render_mode)) {
+        Serial.println("[lvgl] port init failed - continuing headless");
+        return;
+    }
+    logMemory("lvgl");
+
+    {
+        g_phase = "build-ui";
+        ui::LvglGuard guard;
+        ui::radarCreate();
+    }
+
+    if (app::settings().pclk_mhz != 16) {
+        ui::displaySetPixelClock(app::settings().pclk_mhz);
+    }
+
+    // Survived display bring-up: clear the crash counter.
+    g_display_attempts = 0;
 
     g_phase = "running";
     Serial.println("[app] bring-up screen up");
