@@ -50,14 +50,49 @@ struct PsramAllocator : ArduinoJson::Allocator {
 
 PsramAllocator g_allocator;
 
+struct ProviderInfo {
+    const char *name;
+    const char *url_format;
+    bool tls;
+};
+
+/**
+ * adsb.lol is reachable over plain HTTP, which matters more than it looks: a
+ * TLS session needs ~40 kB of *contiguous* internal RAM, and after Wi-Fi and
+ * the RGB panel have taken their share the largest free block hovers around
+ * that figure. Aircraft positions are public data being read, not sent, so the
+ * exposure is a bad actor on the path feeding fake aircraft to a desk toy.
+ * adsb.fi redirects HTTP to HTTPS, so the fallback pays the TLS cost.
+ */
+const ProviderInfo kProviders[] = {
+    {"adsb.lol", "http://api.adsb.lol/v2/lat/%.5f/lon/%.5f/dist/%u", false},
+    {"adsb.fi",  "https://opendata.adsb.fi/api/v2/lat/%.5f/lon/%.5f/dist/%u", true},
+};
+constexpr size_t kProviderCount = sizeof(kProviders) / sizeof(kProviders[0]);
+
+// Which provider we are actually using; may differ from the configured one
+// after a failover.
+size_t g_active_provider = 0;
+uint32_t g_consecutive_failures = 0;
+constexpr uint32_t kFailoverAfter = 3;
+
 void buildUrl(char *out, size_t out_size)
 {
     const app::Settings &settings = app::settings();
-    const char *format = (settings.provider == app::Provider::AdsbFi)
-        ? "https://opendata.adsb.fi/api/v2/lat/%.5f/lon/%.5f/dist/%u"
-        : "https://api.adsb.lol/v2/lat/%.5f/lon/%.5f/dist/%u";
-    snprintf(out, out_size, format, settings.home_lat, settings.home_lon,
-             (unsigned)settings.radius_nm);
+    snprintf(out, out_size, kProviders[g_active_provider].url_format,
+             settings.home_lat, settings.home_lon, (unsigned)settings.radius_nm);
+}
+
+/** Move to the other provider after repeated failures. */
+void considerFailover()
+{
+    if (g_consecutive_failures < kFailoverAfter) {
+        return;
+    }
+    g_active_provider = (g_active_provider + 1) % kProviderCount;
+    g_consecutive_failures = 0;
+    Serial.printf("[adsb] switching to %s after %u failures\n",
+                  kProviders[g_active_provider].name, (unsigned)kFailoverAfter);
 }
 
 void configureTls(WiFiClientSecure &client)
@@ -190,8 +225,13 @@ bool fetchOnce()
     char url[160];
     buildUrl(url, sizeof(url));
 
-    WiFiClientSecure client;
-    configureTls(client);
+    const ProviderInfo &provider = kProviders[g_active_provider];
+    WiFiClient plain_client;
+    WiFiClientSecure tls_client;
+    if (provider.tls) {
+        configureTls(tls_client);
+    }
+    WiFiClient &client = provider.tls ? static_cast<WiFiClient &>(tls_client) : plain_client;
 
     HTTPClient http;
     http.setUserAgent(kUserAgent);
@@ -199,13 +239,18 @@ bool fetchOnce()
     http.setConnectTimeout(kHttpTimeoutMs);
     http.useHTTP10(true);              // stream the body instead of chunk-decoding it
     if (!http.begin(client, url)) {
+        Serial.printf("[adsb] %s: connection setup failed\n", provider.name);
+        portENTER_CRITICAL(&g_stats_mux);
+        g_stats.failure_count++;
+        portEXIT_CRITICAL(&g_stats_mux);
         return false;
     }
 
     const uint32_t started_ms = millis();
     const int status = http.GET();
     if (status != HTTP_CODE_OK) {
-        Serial.printf("[adsb] HTTP %d\n", status);
+        Serial.printf("[adsb] %s: HTTP %d (%s)\n", provider.name, status,
+                      HTTPClient::errorToString(status).c_str());
         http.end();
         portENTER_CRITICAL(&g_stats_mux);
         g_stats.last_http_code = status;
@@ -234,7 +279,10 @@ bool fetchOnce()
 
     JsonArrayConst array = aircraftArray(doc);
     if (array.isNull()) {
-        Serial.println("[adsb] response has no aircraft array");
+        Serial.printf("[adsb] %s: response has no aircraft array\n", provider.name);
+        portENTER_CRITICAL(&g_stats_mux);
+        g_stats.failure_count++;
+        portEXIT_CRITICAL(&g_stats_mux);
         return false;
     }
 
@@ -278,8 +326,8 @@ bool fetchOnce()
     g_stats.last_duration_ms = now_ms - started_ms;
     portEXIT_CRITICAL(&g_stats_mux);
 
-    Serial.printf("[adsb] %u/%u aircraft, %d bytes, %ums\n",
-                  (unsigned)accepted, (unsigned)total, content_length,
+    Serial.printf("[adsb] %s: %u/%u aircraft, %d bytes, %ums\n",
+                  provider.name, (unsigned)accepted, (unsigned)total, content_length,
                   (unsigned)(now_ms - started_ms));
     return true;
 }
@@ -294,7 +342,22 @@ void adsbTask(void *)
         g_stats.last_attempt_ms = started;
         portEXIT_CRITICAL(&g_stats_mux);
 
+        // A settings change resets the failover choice.
+        const size_t configured = (size_t)app::settings().provider;
+        static size_t last_configured = SIZE_MAX;
+        if (configured != last_configured) {
+            last_configured = configured;
+            g_active_provider = configured % kProviderCount;
+            g_consecutive_failures = 0;
+        }
+
         const bool ok = app::settings().position_set && fetchOnce();
+        if (ok) {
+            g_consecutive_failures = 0;
+        } else {
+            g_consecutive_failures++;
+            considerFailover();
+        }
         backoff_ms = ok ? 0 : (backoff_ms == 0 ? kPollIntervalMs
                                                : min(backoff_ms * 2, kBackoffMaxMs));
 

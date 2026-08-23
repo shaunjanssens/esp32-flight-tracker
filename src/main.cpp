@@ -7,10 +7,14 @@
 
 #include <Arduino.h>
 #include <esp_display_panel.hpp>
-#include <driver/i2c_master.h>
+#include <driver/i2c.h>
 #include <esp_heap_caps.h>
 #include <lvgl.h>
 
+#include "app/config.h"
+#include "model/aircraft.h"
+#include "net/adsb_client.h"
+#include "net/wifi_manager.h"
 #include "ui/lvgl_port.h"
 
 using namespace esp_panel::drivers;
@@ -19,45 +23,55 @@ using namespace esp_panel::board;
 namespace {
 
 Board *g_board = nullptr;
+
+/**
+ * Where setup() has got to. A heartbeat task prints this continuously, because
+ * the USB CDC drops anything written before the host opens the port — one-shot
+ * prints during boot are simply lost, and a hang looks identical to silence.
+ */
+volatile const char *g_phase = "start";
+
+void heartbeatTask(void *)
+{
+    while (true) {
+        Serial.printf("[phase] %s  up=%us  sram=%uk psram=%uk\n",
+                      g_phase, (unsigned)(millis() / 1000),
+                      (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                      (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
 lv_obj_t *g_sweep = nullptr;
 lv_obj_t *g_touch_dot = nullptr;
 lv_obj_t *g_stats_label = nullptr;
 
 /**
- * The touch controller, the IO expander and the RTC all share I2C0
- * (SCL 7 / SDA 15). Scanning before the panel driver claims the bus tells us
- * which chips this particular board revision actually carries.
+ * Probe I2C0 (SCL 7 / SDA 15), which the touch controller, the IO expander and
+ * the RTC share, to see which chips this board revision actually carries.
  *
- * This uses the IDF 5 i2c_master driver, not Arduino's Wire: the panel library
- * uses the new driver, and mixing the two aborts at boot with
- * "driver_ng is not allowed to be used with this old driver".
+ * This deliberately uses the *legacy* driver/i2c.h API. ESP32_IO_Expander links
+ * the legacy driver, and IDF registers a global constructor that aborts the
+ * whole firmware at startup if the new i2c_master driver is linked alongside it
+ * ("CONFLICT! driver_ng is not allowed to be used with this old driver").
+ * Must be called after Board::init() has configured the bus.
  */
 void scanI2C()
 {
-    i2c_master_bus_config_t bus_config = {};
-    bus_config.i2c_port = I2C_NUM_0;
-    bus_config.sda_io_num = GPIO_NUM_15;
-    bus_config.scl_io_num = GPIO_NUM_7;
-    bus_config.clk_source = I2C_CLK_SRC_DEFAULT;
-    bus_config.glitch_ignore_cnt = 7;
-    bus_config.flags.enable_internal_pullup = true;
-
-    i2c_master_bus_handle_t bus = nullptr;
-    if (i2c_new_master_bus(&bus_config, &bus) != ESP_OK) {
-        Serial.println("[i2c] scan skipped: bus busy");
-        return;
-    }
-
     Serial.print("[i2c] devices:");
     int found = 0;
     for (uint8_t address = 0x08; address < 0x78; address++) {
-        if (i2c_master_probe(bus, address, 50) == ESP_OK) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (address << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        const esp_err_t err = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(50));
+        i2c_cmd_link_delete(cmd);
+        if (err == ESP_OK) {
             Serial.printf(" 0x%02X", address);
             found++;
         }
     }
     Serial.println(found == 0 ? " none!" : "");
-    i2c_del_master_bus(bus);
 }
 
 void logMemory(const char *stage)
@@ -96,12 +110,19 @@ void statsTimer(lv_timer_t *timer)
     const uint32_t now = millis();
     const uint32_t uptime_s = now / 1000;
 
-    lv_label_set_text_fmt(
-        g_stats_label, "%us up\nSRAM %uk  PSRAM %uk",
-        (unsigned)uptime_s,
-        (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
-        (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024)
-    );
+    const net::FeedStats feed = net::adsbStats();
+    const char *network_line = net::wifiState() == net::WifiState::Connected
+        ? net::wifiAddress()
+        : (net::wifiState() == net::WifiState::PortalActive ? net::wifiNetwork() : "connecting...");
+
+    if (feed.last_success_ms == 0) {
+        lv_label_set_text_fmt(g_stats_label, "%s\n%us up  -  no feed yet",
+                              network_line, (unsigned)uptime_s);
+    } else {
+        lv_label_set_text_fmt(g_stats_label, "%s\n%u aircraft  -  %us ago",
+                              network_line, (unsigned)feed.accepted,
+                              (unsigned)((now - feed.last_success_ms) / 1000));
+    }
     last_ms = now;
     LV_UNUSED(timer);
     LV_UNUSED(last_ms);
@@ -164,7 +185,7 @@ void buildBringUpScreen()
     lv_obj_align(title, LV_ALIGN_CENTER, 0, -40);
 
     lv_obj_t *subtitle = lv_label_create(screen);
-    lv_label_set_text_fmt(subtitle, "bring-up  ·  LVGL %d.%d.%d",
+    lv_label_set_text_fmt(subtitle, "bring-up  -  LVGL %d.%d.%d",
                           LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
     lv_obj_set_style_text_color(subtitle, lv_color_hex(0x6E8AA6), 0);
     lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_12, 0);
@@ -208,14 +229,19 @@ void setup()
     // and to leave esptool a window to grab the board if the app ever crash-loops.
     delay(1500);
     Serial.println("\n\n=== ESP32 Flight Tracker :: bring-up ===");
+    xTaskCreatePinnedToCore(heartbeatTask, "heartbeat", 4096, nullptr, 1, nullptr, 0);
     logMemory("boot");
-    scanI2C();
+
+    g_phase = "board-init";
 
     g_board = new Board();
     if (!g_board->init()) {
         Serial.println("[board] init failed");
         return;
     }
+
+    g_phase = "i2c-scan";
+    scanI2C();
 
     // An RGB panel streams its framebuffer out of PSRAM continuously; Wi-Fi and
     // TLS compete for that same bandwidth and the picture shears. Bounce buffers
@@ -224,11 +250,12 @@ void setup()
     if (lcd != nullptr) {
         Bus *bus = lcd->getBus();
         if (bus != nullptr && bus->getBasicAttributes().type == ESP_PANEL_BUS_TYPE_RGB) {
-            static_cast<BusRGB *>(bus)->configRGB_BounceBufferSize(lcd->getFrameWidth() * 10);
-            Serial.println("[board] RGB bounce buffer: 10 lines");
+            static_cast<BusRGB *>(bus)->configRGB_BounceBufferSize(lcd->getFrameWidth() * 20);
+            Serial.println("[board] RGB bounce buffer: 20 lines");
         }
     }
 
+    g_phase = "board-begin";
     if (!g_board->begin()) {
         Serial.println("[board] begin failed");
         return;
@@ -240,6 +267,7 @@ void setup()
         backlight->setBrightness(100);
     }
 
+    g_phase = "lvgl-init";
     if (!ui::lvglPortInit(g_board->getLCD(), g_board->getTouch())) {
         Serial.println("[lvgl] port init failed");
         return;
@@ -247,10 +275,28 @@ void setup()
     logMemory("lvgl");
 
     {
+        g_phase = "build-ui";
         ui::LvglGuard guard;
         buildBringUpScreen();
     }
 
+    g_phase = "store";
+    if (!model::store().begin()) {
+        Serial.println("[app] aircraft store allocation failed");
+    }
+
+    g_phase = "wifi";
+    app::settings().load();
+    if (!net::wifiBegin()) {
+        Serial.println("[app] wifi task failed to start");
+    }
+
+    g_phase = "adsb";
+    if (!net::adsbStart()) {
+        Serial.println("[app] adsb task failed to start");
+    }
+
+    g_phase = "running";
     Serial.println("[app] bring-up screen up");
     logMemory("ui");
 }

@@ -8,15 +8,18 @@ using namespace esp_panel::drivers;
 namespace ui {
 namespace {
 
-// The radar redraws large areas, so the partial buffers are generously sized.
-// They live in PSRAM: the RGB panel does not DMA from them (flush is a copy into
-// the panel's own framebuffer), and internal SRAM is needed for Wi-Fi and TLS.
-constexpr int kBufferLines = 60;
+// Draw buffers live in *internal* RAM: the RGB panel already saturates PSRAM
+// bandwidth streaming the framebuffer, and reading the flush source from PSRAM
+// too is what tears the left edge of the picture. 16 lines keeps the pair at
+// ~31 kB, which internal RAM can spare now that the feed uses plain HTTP.
+constexpr int kBufferLines = 16;
 constexpr int kTaskCore = 1;          // UI on core 1, networking on core 0
 constexpr int kTaskPriority = 2;
 constexpr int kTaskStack = 8 * 1024;
 constexpr int kMaxDelayMs = 100;
 constexpr int kMinDelayMs = 2;
+constexpr uint32_t kTouchFailureLimit = 10;
+constexpr uint32_t kTouchRetryMs = 5000;
 
 SemaphoreHandle_t g_mutex = nullptr;
 lv_display_t *g_display = nullptr;
@@ -39,7 +42,34 @@ void touchReadCallback(lv_indev_t *indev, lv_indev_data_t *data)
     TouchPoint point;
 
     data->state = LV_INDEV_STATE_RELEASED;
-    if (touch->readPoints(&point, 1, 0) > 0) {
+
+    // A touch controller that never answers must not be polled 30 times a
+    // second: each failure logs three lines and the console flood costs more
+    // time than the UI itself. Back off to one retry every 5 s instead.
+    static uint32_t consecutive_failures = 0;
+    static uint32_t next_retry_ms = 0;
+    if (consecutive_failures >= kTouchFailureLimit) {
+        if (millis() < next_retry_ms) {
+            return;
+        }
+        next_retry_ms = millis() + kTouchRetryMs;
+    }
+
+    const int read = touch->readPoints(&point, 1, 0);
+    if (read < 0) {
+        consecutive_failures++;
+        if (consecutive_failures == kTouchFailureLimit) {
+            Serial.println("[touch] controller not responding, backing off to 1 poll / 5 s");
+        }
+        return;
+    }
+
+    if (consecutive_failures >= kTouchFailureLimit) {
+        Serial.println("[touch] controller answered again");
+    }
+    consecutive_failures = 0;
+
+    if (read > 0) {
         data->point.x = point.x;
         data->point.y = point.y;
         data->state = LV_INDEV_STATE_PRESSED;
@@ -102,8 +132,16 @@ bool lvglPortInit(LCD *lcd, Touch *touch)
     const int height = lcd->getFrameHeight();
     const size_t buffer_bytes = (size_t)width * kBufferLines * sizeof(lv_color16_t);
 
-    void *buf1 = heap_caps_malloc(buffer_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    void *buf2 = heap_caps_malloc(buffer_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *buf1 = heap_caps_malloc(buffer_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    void *buf2 = heap_caps_malloc(buffer_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (buf1 == nullptr || buf2 == nullptr) {
+        // Internal RAM is tight; PSRAM still works, it just draws worse.
+        heap_caps_free(buf1);
+        heap_caps_free(buf2);
+        buf1 = heap_caps_malloc(buffer_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        buf2 = heap_caps_malloc(buffer_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        Serial.println("[lvgl] falling back to PSRAM draw buffers");
+    }
     if (buf1 == nullptr || buf2 == nullptr) {
         Serial.printf("[lvgl] could not allocate 2 x %u byte draw buffers\n", (unsigned)buffer_bytes);
         heap_caps_free(buf1);
@@ -139,7 +177,7 @@ bool lvglPortInit(LCD *lcd, Touch *touch)
         return false;
     }
 
-    Serial.printf("[lvgl] up: %dx%d, 2 x %u byte buffers in PSRAM\n",
+    Serial.printf("[lvgl] up: %dx%d, 2 x %u byte draw buffers\n",
                   width, height, (unsigned)buffer_bytes);
     return true;
 }
