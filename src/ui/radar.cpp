@@ -259,6 +259,14 @@ void drawAircraft()
     }
 }
 
+/**
+ * Only the things that mean something is wrong.
+ *
+ * The clock, the aircraft count and the range readout all lived here and are
+ * gone on purpose: the rings are already labelled in nm, and a count is
+ * information the picture itself carries. What is left is the state you cannot
+ * infer by looking - the feed being stale, or the device waiting for setup.
+ */
 void drawCentre()
 {
     const net::FeedStats feed = net::adsbStats();
@@ -266,42 +274,52 @@ void drawCentre()
         ? 0 : (millis() - feed.last_success_ms) / 1000;
     const bool stale = feed.last_success_ms == 0 || age_s > 20;
 
-    char clock_text[8] = "--:--";
-    const time_t now = time(nullptr);
-    if (now > 1700000000) {
-        struct tm local;
-        localtime_r(&now, &local);
-        strftime(clock_text, sizeof(clock_text), "%H:%M", &local);
+    if (net::wifiState() != net::WifiState::PortalActive && !stale) {
+        return;
     }
-
-    g_frame.setTextDatum(textdatum_t::middle_center);
-    g_frame.setFont(&fonts::FreeSansBold12pt7b);
-    g_frame.setTextColor(kColourLabel);
-    g_frame.drawString(clock_text, kCentre, kCentre + 32);
 
     char status[48];
     if (net::wifiState() == net::WifiState::PortalActive) {
         snprintf(status, sizeof(status), "setup: %s", net::wifiNetwork());
-    } else if (stale) {
-        snprintf(status, sizeof(status), "no data %us", (unsigned)age_s);
     } else {
-        snprintf(status, sizeof(status), "%u aircraft   %u nm",
-                 (unsigned)feed.accepted, (unsigned)app::settings().radius_nm);
+        snprintf(status, sizeof(status), "no data %us", (unsigned)age_s);
     }
-    g_frame.setFont(&fonts::FreeSans9pt7b);
-    g_frame.setTextColor(stale ? kColourStale : kColourRingLabel);
-    g_frame.drawString(status, kCentre, kCentre + 56);
 
-    if (millis() < g_range_hint_until) {
-        char range[16];
-        snprintf(range, sizeof(range), "%u nm", (unsigned)app::settings().radius_nm);
-        g_frame.setFont(&fonts::FreeSansBold18pt7b);
-        g_frame.setTextColor(kColourHome);
-        g_frame.drawString(range, kCentre, kCentre - 52);
-    }
+    g_frame.setTextDatum(textdatum_t::middle_center);
+    g_frame.setFont(&fonts::FreeSans9pt7b);
+    g_frame.setTextColor(kColourStale);
+    g_frame.drawString(status, kCentre, kCentre + 34);
 }
 
-/** Detail panel for the selected aircraft, over the lower part of the face. */
+// The detail panel's vertical extent. Its sides follow the screen edge.
+constexpr int32_t kPanelTop = 290;
+constexpr int32_t kPanelBottom = 430;
+constexpr int32_t kPanelInset = 12;      // gap between panel edge and glass
+
+/** Half-width of the panel at row `y`, following the circle. */
+int32_t panelHalfWidth(int32_t y)
+{
+    const float dy = (float)(y - kCentre);
+    const float radius = (float)(kPlotRadius + 30 - kPanelInset);
+    const float squared = radius * radius - dy * dy;
+    return squared <= 0.0f ? 0 : (int32_t)sqrtf(squared);
+}
+
+bool insidePanel(int32_t x, int32_t y)
+{
+    if (y < kPanelTop || y > kPanelBottom) {
+        return false;
+    }
+    return abs(x - kCentre) <= panelHalfWidth(y);
+}
+
+/**
+ * Detail panel for the selected aircraft.
+ *
+ * Drawn as horizontal spans whose width follows the circle rather than as a
+ * rectangle: on a round 480x480 panel a box wide enough to read runs off the
+ * glass at this height, taking its text with it.
+ */
 void drawDetail()
 {
     if (g_selected_icao == 0) {
@@ -323,33 +341,41 @@ void drawDetail()
         return;
     }
 
-    constexpr int32_t kTop = 292;
-    g_frame.fillRoundRect(24, kTop, 432, 164, 14, kColourPanel);
-    g_frame.drawRoundRect(24, kTop, 432, 164, 14, kColourPanelEdge);
+    for (int32_t y = kPanelTop; y <= kPanelBottom; y++) {
+        const int32_t half = panelHalfWidth(y);
+        if (half <= 0) {
+            continue;
+        }
+        // Round off the top corners so it reads as a panel, not a slab.
+        const int32_t corner = kPanelTop + 10 - y;
+        const int32_t trim = corner > 0 ? (int32_t)(10 - sqrtf((float)(100 - (10 - corner) * (10 - corner)))) : 0;
+        const uint16_t colour = (y == kPanelTop || y == kPanelBottom) ? kColourPanelEdge : kColourPanel;
+        g_frame.drawFastHLine(kCentre - half + trim, y, (half - trim) * 2, colour);
+    }
 
     const net::RouteInfo *route = net::routeLookup(copy.icao, copy.flight);
 
-    g_frame.setTextDatum(textdatum_t::top_left);
+    g_frame.setTextDatum(textdatum_t::middle_center);
     g_frame.setFont(&fonts::FreeSansBold12pt7b);
     g_frame.setTextColor(kColourSelected);
-    g_frame.drawString(copy.flight[0] != '\0' ? copy.flight : "unknown", 44, kTop + 14);
+    g_frame.drawString(copy.flight[0] != '\0' ? copy.flight : "unknown", kCentre, kPanelTop + 22);
 
     g_frame.setFont(&fonts::FreeSans9pt7b);
     if (route != nullptr && route->route_known) {
         char line[48];
-        snprintf(line, sizeof(line), "%s > %s", route->origin_iata, route->dest_iata);
+        snprintf(line, sizeof(line), "%s  >  %s", route->origin_iata, route->dest_iata);
         g_frame.setTextColor(kColourHome);
-        g_frame.drawString(line, 44, kTop + 46);
+        g_frame.drawString(line, kCentre, kPanelTop + 50);
 
         snprintf(line, sizeof(line), "%s - %s", route->origin_city, route->dest_city);
         g_frame.setTextColor(kColourDim);
-        g_frame.drawString(line, 44, kTop + 66);
+        g_frame.drawString(line, kCentre, kPanelTop + 72);
     } else if (route != nullptr && route->pending) {
         g_frame.setTextColor(kColourDim);
-        g_frame.drawString("looking up route...", 44, kTop + 46);
+        g_frame.drawString("looking up route...", kCentre, kPanelTop + 50);
     } else {
         g_frame.setTextColor(kColourDim);
-        g_frame.drawString("no route on file", 44, kTop + 46);
+        g_frame.drawString("no route on file", kCentre, kPanelTop + 50);
     }
 
     char identity[52];
@@ -360,15 +386,14 @@ void drawDetail()
                  copy.type[0] != '\0' ? copy.type : "type unknown", copy.reg);
     }
     g_frame.setTextColor(kColourLabel);
-    g_frame.drawString(identity, 44, kTop + 90);
+    g_frame.drawString(identity, kCentre, kPanelTop + 96);
 
     char figures[64];
-    const char *arrow = copy.vs_fpm > 200 ? "up" : (copy.vs_fpm < -200 ? "down" : "level");
-    snprintf(figures, sizeof(figures), "FL%03d %s   %d kt   %.1f nm   %03d deg",
-             (int)(copy.alt_ft / 100), arrow, (int)copy.gs_kt, copy.dst_nm,
-             (int)copy.dir_deg);
+    const char *trend = copy.vs_fpm > 200 ? "climbing" : (copy.vs_fpm < -200 ? "descending" : "level");
+    snprintf(figures, sizeof(figures), "FL%03d %s   %d kt   %.1f nm   %03d",
+             (int)(copy.alt_ft / 100), trend, (int)copy.gs_kt, copy.dst_nm, (int)copy.dir_deg);
     g_frame.setTextColor(kColourDim);
-    g_frame.drawString(figures, 44, kTop + 116);
+    g_frame.drawString(figures, kCentre, kPanelTop + 120);
 }
 
 void renderFrame()
@@ -446,7 +471,13 @@ void handleTouch()
             g_bezel_drag = false;
             return;
         }
-        // A tap: pick the nearest aircraft, or dismiss the detail panel.
+        // A tap on the open panel dismisses it, without hunting for an
+        // aircraft underneath it.
+        if (g_selected_icao != 0 && insidePanel(g_press_x, g_press_y)) {
+            g_selected_icao = 0;
+            return;
+        }
+
         const float s = scale();
         const float x_nm = (float)(g_press_x - kCentre) / s;
         const float y_nm = (float)(kCentre - g_press_y) / s;
