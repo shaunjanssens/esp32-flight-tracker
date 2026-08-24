@@ -6,6 +6,16 @@ aircraft data comes from community feeds over Wi-Fi.
 
 Runs on the **Waveshare ESP32-S3-Touch-LCD-2.1** (ESP32-S3R8, 8 MB octal PSRAM, 16 MB flash).
 
+<p align="center">
+  <img src="docs/ui-radar.png" width="46%" alt="Radar face: range rings, cardinal marks,
+       aircraft with callsigns and trails, and an aircraft squawking 7700 ringed in red">
+  <img src="docs/ui-detail.png" width="46%" alt="Detail panel: callsign, route, aircraft
+       type and registration, altitude, speed and distance">
+</p>
+
+<p align="center"><em>The radar face, and the panel that opens when you tap an aircraft.
+Drawn at the panel's own 480&times;480 &mdash; this is the interface, not a photograph.</em></p>
+
 ## Install
 
 **[Flash it from your browser →](https://shaunjanssens.github.io/esp32-flight-tracker/)**
