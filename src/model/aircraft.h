@@ -32,6 +32,8 @@ struct Aircraft {
     int16_t  gs_kt;
     int16_t  vs_fpm;
 
+    char     squawk[5];            // transponder code; 7500/7600/7700 matter
+    bool     emergency;            // squawk is one of the emergency codes
     bool     on_ground;
     bool     mlat;                 // position is multilaterated, not ADS-B
     bool     has_position;

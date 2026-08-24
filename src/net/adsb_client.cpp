@@ -146,7 +146,7 @@ void buildFilter(JsonDocument &filter)
 {
     static const char *kFields[] = {
         "hex", "flight", "r", "t", "alt_baro", "gs", "track", "baro_rate",
-        "geom_rate", "lat", "lon", "dst", "dir", "mlat", "desc"
+        "geom_rate", "lat", "lon", "dst", "dir", "mlat", "desc", "squawk", "emergency"
     };
     for (const char *root : {"ac", "aircraft"}) {
         JsonObject element = filter[root].add<JsonObject>();
@@ -203,6 +203,15 @@ void applyRecord(model::Aircraft &aircraft, JsonObjectConst record, uint32_t now
     aircraft.vs_fpm = (int16_t)(record["baro_rate"] | (record["geom_rate"] | 0));
     aircraft.track_deg = record["track"] | 0.0f;
     aircraft.mlat = record["mlat"].is<JsonArrayConst>() && record["mlat"].size() > 0;
+
+    // 7500 hijack, 7600 radio failure, 7700 general emergency. The feed also
+    // carries an "emergency" string, but only some receivers populate it.
+    copyTrimmed(aircraft.squawk, sizeof(aircraft.squawk), record["squawk"] | "");
+    const char *emergency = record["emergency"] | "none";
+    aircraft.emergency = (strcmp(aircraft.squawk, "7500") == 0) ||
+                         (strcmp(aircraft.squawk, "7600") == 0) ||
+                         (strcmp(aircraft.squawk, "7700") == 0) ||
+                         (emergency[0] != '\0' && strcmp(emergency, "none") != 0);
 
     const float dst = record["dst"] | -1.0f;
     const float dir = record["dir"] | 0.0f;

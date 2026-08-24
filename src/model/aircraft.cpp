@@ -3,6 +3,8 @@
 #include <esp_heap_caps.h>
 #include <math.h>
 
+#include "app/config.h"
+
 namespace model {
 namespace {
 
@@ -148,6 +150,9 @@ int Store::nearest(uint32_t now_ms, float x_nm, float y_nm, float max_nm) const
     for (size_t i = 0; i < count_; i++) {
         if (!items_[i].has_position) {
             continue;
+        }
+        if (app::settings().hide_ground && items_[i].on_ground) {
+            continue;      // not drawn, so it must not be tappable
         }
         float x, y;
         items_[i].positionAt(now_ms, x, y);

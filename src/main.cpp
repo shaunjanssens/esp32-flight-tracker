@@ -172,10 +172,54 @@ void setup()
     app::logf("[app] running");
 }
 
+/**
+ * Backlight follows the clock, with a touch overriding it.
+ *
+ * The window wraps midnight (22 -> 7), which is the normal case, so the
+ * comparison differs depending on whether start is before or after end.
+ */
+void applyBrightness()
+{
+    const app::Settings &settings = app::settings();
+    uint8_t target = settings.day_brightness;
+
+    const time_t now = time(nullptr);
+    if (settings.night_dimming && now > 1700000000) {
+        struct tm local;
+        localtime_r(&now, &local);
+        const int hour = local.tm_hour;
+        const int start = settings.night_start_hour;
+        const int end = settings.night_end_hour;
+        const bool night = (start <= end) ? (hour >= start && hour < end)
+                                          : (hour >= start || hour < end);
+        if (night) {
+            target = settings.night_brightness;
+        }
+    }
+
+    // Any touch restores full brightness for a while, so a dimmed screen is
+    // never a dead-looking one.
+    if (millis() - ui::radarLastTouchMs() < 30000 && ui::radarLastTouchMs() != 0) {
+        target = settings.day_brightness;
+    }
+
+    static uint8_t applied = 255;
+    if (target != applied) {
+        applied = target;
+        hw::displayBrightness(target);
+    }
+}
+
 void loop()
 {
     if (!g_headless) {
         ui::radarTick();
+
+        static uint32_t next_brightness_ms = 0;
+        if ((int32_t)(millis() - next_brightness_ms) >= 0) {
+            next_brightness_ms = millis() + 5000;
+            applyBrightness();
+        }
     }
     delay(5);
 }

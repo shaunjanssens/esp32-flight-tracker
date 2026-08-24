@@ -32,6 +32,43 @@ struct Settings {
 
     bool imu_orientation = true;
 
+    /** Hide aircraft the feed reports as on the ground. */
+    bool hide_ground = false;
+
+    /**
+     * Rotate the compass rose, in degrees clockwise.
+     *
+     * The plot is polar, so this costs nothing: it is added to every bearing
+     * before it becomes a screen position. Set it to match how the device sits
+     * on the desk - with 270 here, north points left.
+     */
+    uint16_t north_offset_deg = 0;
+
+    /**
+     * Screen orientation in degrees clockwise, in 45-degree steps.
+     *
+     * Free-angle rather than the usual 0/90/180/270 because the USB port on
+     * this board sits at 135 degrees, and a printed case wants it at the
+     * bottom. The screen is round, so rotating the square frame only throws
+     * away corners that were never visible.
+     */
+    uint16_t display_rotation_deg = 0;
+
+    /** Hide anything above this flight level; 0 disables the filter. */
+    uint16_t max_flight_level = 0;
+
+    /** 0 no trails, 1 selected aircraft only, 2 all. Trails are the per-frame cost. */
+    uint8_t trail_mode = 2;
+
+    /** How many of the nearest aircraft get a label. */
+    uint8_t label_count = 8;
+
+    /** Add altitude under the callsign. Off by default - it doubles the text. */
+    bool label_altitude = false;
+
+    /** false: nm, ft, kt. true: km, m, km/h. */
+    bool metric = false;
+
 
 
 

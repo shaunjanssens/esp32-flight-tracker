@@ -19,7 +19,6 @@ constexpr int32_t kCentre     = 240;
 constexpr int32_t kPlotRadius = 196;
 constexpr int32_t kTapSlopPx  = 34;
 constexpr float   kDegreesPerStep = 50.0f;
-constexpr size_t  kMaxLabels  = 8;
 
 /** 24-bit hex to RGB565, so the palette reads like CSS. */
 constexpr uint16_t rgb(uint32_t value)
@@ -63,6 +62,7 @@ bool  g_long_fired = false;      // this press already opened settings
 bool  g_long_cancelled = false;  // moved too far to count as a long press
 int16_t g_press_x = 0, g_press_y = 0;
 uint32_t g_press_ms = 0;
+uint32_t g_last_touch_ms = 0;
 
 constexpr uint32_t kLongPressMs = 600;
 constexpr int32_t  kLongPressSlopPx = 16;
@@ -97,6 +97,19 @@ void chipRect(size_t index, int32_t &x, int32_t &y, int32_t &w, int32_t &h)
     h = kChipHeight;
 }
 
+constexpr uint16_t kColourEmergency = rgb(0xFF3B30);
+
+/** Distance for display: nm, or km when metric is set. */
+float displayDistance(float nm)
+{
+    return app::settings().metric ? nm * 1.852f : nm;
+}
+
+const char *distanceUnit()
+{
+    return app::settings().metric ? "km" : "nm";
+}
+
 uint16_t altitudeColour(const model::Aircraft &aircraft)
 {
     if (aircraft.on_ground)        return rgb(0x7E8CA0);
@@ -112,11 +125,60 @@ float scale()
     return (float)kPlotRadius / (float)(radius_nm == 0 ? 1 : radius_nm);
 }
 
+/**
+ * Screen point to drawing point, undoing the frame rotation.
+ *
+ * Everything below works in the composed frame's coordinates, so the rotation
+ * is undone once, here, the moment a touch arrives.
+ */
+void screenToDrawing(int32_t px, int32_t py, int32_t &dx, int32_t &dy)
+{
+    const uint16_t degrees = app::settings().display_rotation_deg % 360;
+    if (degrees == 0) {
+        dx = px;
+        dy = py;
+        return;
+    }
+    const float a = (float)degrees * (float)DEG_TO_RAD;
+    const float ca = cosf(a);
+    const float sa = sinf(a);
+    const float rx = (float)(px - kCentre);
+    const float ry = (float)(py - kCentre);
+    dx = kCentre + (int32_t)lroundf(rx * ca + ry * sa);
+    dy = kCentre + (int32_t)lroundf(-rx * sa + ry * ca);
+}
+
+/** Compass rotation in radians, clockwise. */
+float northOffset()
+{
+    return (float)app::settings().north_offset_deg * (float)DEG_TO_RAD;
+}
+
 void toScreen(float x_nm, float y_nm, float &sx, float &sy)
 {
     const float s = scale();
-    sx = (float)kCentre + x_nm * s;
-    sy = (float)kCentre - y_nm * s;      // north up
+    const float a = northOffset();
+    const float ca = cosf(a);
+    const float sa = sinf(a);
+    // Rotating here is free: the plot is polar, so the offset is just added to
+    // every bearing before it becomes a position.
+    const float rx = x_nm * ca + y_nm * sa;
+    const float ry = -x_nm * sa + y_nm * ca;
+    sx = (float)kCentre + rx * s;
+    sy = (float)kCentre - ry * s;
+}
+
+/** Screen point back to local nm, undoing the compass rotation. */
+void fromScreen(int32_t px, int32_t py, float &x_nm, float &y_nm)
+{
+    const float s = scale();
+    const float rx = (float)(px - kCentre) / s;
+    const float ry = (float)(kCentre - py) / s;
+    const float a = northOffset();
+    const float ca = cosf(a);
+    const float sa = sinf(a);
+    x_nm = rx * ca - ry * sa;
+    y_nm = rx * sa + ry * ca;
 }
 
 bool onScreen(float sx, float sy)
@@ -149,12 +211,16 @@ void drawGrid()
         g_grid.setFont(&fonts::FreeSans9pt7b);
         g_grid.setTextDatum(textdatum_t::middle_center);
         g_grid.setTextColor(kColourRingLabel, kColourBackground);
-        g_grid.drawNumber(radius_nm * step / 4,
+        char ring_label[8];
+        snprintf(ring_label, sizeof(ring_label), "%d",
+                 (int)lroundf(displayDistance((float)(radius_nm * step) / 4.0f)));
+        g_grid.drawString(ring_label,
                           (int32_t)(kCentre + diagonal), (int32_t)(kCentre - diagonal));
     }
 
+    const float offset_deg = (float)app::settings().north_offset_deg;
     for (int degrees = 0; degrees < 360; degrees += 30) {
-        const float radians = degrees * (float)DEG_TO_RAD;
+        const float radians = (degrees + offset_deg) * (float)DEG_TO_RAD;
         const float sin_a = sinf(radians);
         const float cos_a = cosf(radians);
         g_grid.drawWideLine((int32_t)(kCentre + sin_a * (kPlotRadius - 8)),
@@ -168,7 +234,7 @@ void drawGrid()
     g_grid.setFont(&fonts::FreeSansBold12pt7b);
     g_grid.setTextDatum(textdatum_t::middle_center);
     for (int i = 0; i < 4; i++) {
-        const float radians = kAngles[i] * (float)DEG_TO_RAD;
+        const float radians = ((float)kAngles[i] + offset_deg) * (float)DEG_TO_RAD;
         g_grid.setTextColor(i == 0 ? kColourNorth : kColourCardinal, kColourBackground);
         g_grid.drawString(kNames[i],
                           (int32_t)(kCentre + sinf(radians) * (kPlotRadius + 22)),
@@ -241,12 +307,23 @@ void drawAircraft()
     model::Store &store = model::store();
     const uint32_t now_ms = millis();
 
+    const app::Settings &settings = app::settings();
     size_t order[model::kMaxAircraft];
     size_t count = 0;
     for (size_t i = 0; i < store.size(); i++) {
-        if (store.at(i).has_position) {
-            order[count++] = i;
+        const model::Aircraft &candidate = store.at(i);
+        if (!candidate.has_position) {
+            continue;
         }
+        if (settings.hide_ground && candidate.on_ground) {
+            continue;
+        }
+        // An emergency is never filtered out, whatever the altitude cap says.
+        if (settings.max_flight_level > 0 && !candidate.emergency &&
+            candidate.alt_ft / 100 > (int32_t)settings.max_flight_level) {
+            continue;
+        }
+        order[count++] = i;
     }
     for (size_t i = 1; i < count; i++) {                 // nearest first
         const size_t key = order[i];
@@ -274,22 +351,45 @@ void drawAircraft()
 
         const uint16_t colour = altitudeColour(aircraft);
         const bool selected = (aircraft.icao == g_selected_icao);
-        drawTrail(aircraft, colour);
-        drawBlip(sx, sy, aircraft.track_deg, colour, selected);
 
-        if (labelled < kMaxLabels || selected) {
+        const bool wants_trail = settings.trail_mode == 2 ||
+                                 (settings.trail_mode == 1 && selected);
+        if (wants_trail) {
+            drawTrail(aircraft, colour);
+        }
+        drawBlip(sx, sy, aircraft.track_deg + (float)app::settings().north_offset_deg,
+                 colour, selected);
+
+        // An emergency squawk gets a ring so it is impossible to miss.
+        if (aircraft.emergency) {
+            g_frame.drawCircle((int32_t)sx, (int32_t)sy, 22, kColourEmergency);
+            g_frame.drawCircle((int32_t)sx, (int32_t)sy, 23, kColourEmergency);
+        }
+
+        if (labelled < settings.label_count || selected || aircraft.emergency) {
             labelled++;
             const char *name = aircraft.flight[0] != '\0' ? aircraft.flight : aircraft.type;
-            char altitude[12];
-            if (aircraft.on_ground) {
+            char altitude[16];
+            if (aircraft.emergency) {
+                snprintf(altitude, sizeof(altitude), "SQ %s", aircraft.squawk);
+            } else if (aircraft.on_ground) {
                 snprintf(altitude, sizeof(altitude), "GND");
+            } else if (settings.metric) {
+                snprintf(altitude, sizeof(altitude), "%d m",
+                         (int)(aircraft.alt_ft * 0.3048f));
             } else {
                 snprintf(altitude, sizeof(altitude), "FL%03d", (int)(aircraft.alt_ft / 100));
             }
-            g_frame.setTextColor(selected ? kColourSelected : kColourLabel);
-            g_frame.drawString(name, (int32_t)sx + 13, (int32_t)sy - 11);
-            g_frame.setTextColor(kColourDim);
-            g_frame.drawString(altitude, (int32_t)sx + 13, (int32_t)sy + 4);
+            g_frame.setTextColor(aircraft.emergency ? kColourEmergency
+                                                    : (selected ? kColourSelected : kColourLabel));
+            const int32_t name_y = (settings.label_altitude || aircraft.emergency)
+                                   ? (int32_t)sy - 11 : (int32_t)sy - 4;
+            g_frame.drawString(name, (int32_t)sx + 13, name_y);
+            // An emergency squawk is shown whatever the label setting says.
+            if (settings.label_altitude || aircraft.emergency) {
+                g_frame.setTextColor(aircraft.emergency ? kColourEmergency : kColourDim);
+                g_frame.drawString(altitude, (int32_t)sx + 13, (int32_t)sy + 4);
+            }
         }
     }
 }
@@ -407,16 +507,24 @@ void drawDetail()
     g_frame.setTextColor(kColourSelected);
     g_frame.drawString(copy.flight[0] != '\0' ? copy.flight : "unknown", kCentre, kPanelTop + 22);
 
+    if (copy.emergency) {
+        g_frame.setFont(&fonts::FreeSansBold12pt7b);
+        g_frame.setTextColor(kColourEmergency);
+        char alert[32];
+        snprintf(alert, sizeof(alert), "SQUAWK %s", copy.squawk);
+        g_frame.drawString(alert, kCentre, kPanelTop + 46);
+    }
+
     g_frame.setFont(&fonts::FreeSans9pt7b);
     if (route != nullptr && route->route_known) {
         char line[48];
         snprintf(line, sizeof(line), "%s  >  %s", route->origin_iata, route->dest_iata);
         g_frame.setTextColor(kColourHome);
-        g_frame.drawString(line, kCentre, kPanelTop + 50);
+        g_frame.drawString(line, kCentre, kPanelTop + (copy.emergency ? 70 : 50));
 
         snprintf(line, sizeof(line), "%s - %s", route->origin_city, route->dest_city);
         g_frame.setTextColor(kColourDim);
-        g_frame.drawString(line, kCentre, kPanelTop + 72);
+        g_frame.drawString(line, kCentre, kPanelTop + (copy.emergency ? 88 : 72));
     } else if (route != nullptr && route->pending) {
         g_frame.setTextColor(kColourDim);
         g_frame.drawString("looking up route...", kCentre, kPanelTop + 50);
@@ -435,10 +543,17 @@ void drawDetail()
     g_frame.setTextColor(kColourLabel);
     g_frame.drawString(identity, kCentre, kPanelTop + 96);
 
-    char figures[64];
+    char figures[72];
     const char *trend = copy.vs_fpm > 200 ? "climbing" : (copy.vs_fpm < -200 ? "descending" : "level");
-    snprintf(figures, sizeof(figures), "FL%03d %s   %d kt   %.1f nm   %03d",
-             (int)(copy.alt_ft / 100), trend, (int)copy.gs_kt, copy.dst_nm, (int)copy.dir_deg);
+    if (app::settings().metric) {
+        snprintf(figures, sizeof(figures), "%d m %s   %d km/h   %.1f km   %03d",
+                 (int)(copy.alt_ft * 0.3048f), trend, (int)(copy.gs_kt * 1.852f),
+                 displayDistance(copy.dst_nm), (int)copy.dir_deg);
+    } else {
+        snprintf(figures, sizeof(figures), "FL%03d %s   %d kt   %.1f nm   %03d",
+                 (int)(copy.alt_ft / 100), trend, (int)copy.gs_kt, copy.dst_nm,
+                 (int)copy.dir_deg);
+    }
     g_frame.setTextColor(kColourDim);
     g_frame.drawString(figures, kCentre, kPanelTop + 120);
 }
@@ -537,11 +652,58 @@ void handleSettingsTap(int32_t x, int32_t y)
     }
 }
 
+/**
+ * Put the composed frame on the panel, rotated if the case needs it.
+ *
+ * At 0 degrees this is a straight blit. Otherwise pushRotated transforms the
+ * frame on the way out, which costs a pass over PSRAM - so the frame time is
+ * logged occasionally, because PSRAM bandwidth is what this panel is short of.
+ */
+void presentFrame()
+{
+    const uint16_t degrees = app::settings().display_rotation_deg % 360;
+    const uint32_t started = millis();
+
+    if (degrees == 0) {
+        g_frame.pushSprite(0, 0);
+    } else if (degrees % 90 == 0) {
+        // A quarter turn maps every source pixel onto exactly one destination
+        // pixel, so the plain path is both faster and lossless.
+        g_frame.pushRotated((float)degrees);
+    } else {
+        // At other angles the grids do not line up and something has to give.
+        // Nearest-neighbour frays thin lines and text; blending neighbours
+        // costs a little more bandwidth and looks markedly better.
+        g_frame.pushRotatedWithAA((float)degrees);
+    }
+
+    static uint32_t next_report_ms = 0;
+    if ((int32_t)(millis() - next_report_ms) >= 0) {
+        next_report_ms = millis() + 60000;
+        app::logf("[radar] present %ums at %u deg", (unsigned)(millis() - started),
+                  (unsigned)degrees);
+    }
+}
+
 void renderFrame()
 {
+    // The grid bakes in the range labels, the units and the compass rotation,
+    // so it has to be redrawn when any of them change from the web UI.
+    static uint16_t grid_radius_nm = 0;
+    static uint16_t grid_north_deg = 0xFFFF;
+    static bool grid_metric = false;
+    if (grid_radius_nm != app::settings().radius_nm ||
+        grid_north_deg != app::settings().north_offset_deg ||
+        grid_metric != app::settings().metric) {
+        grid_radius_nm = app::settings().radius_nm;
+        grid_north_deg = app::settings().north_offset_deg;
+        grid_metric = app::settings().metric;
+        g_grid_dirty = true;
+    }
+
     if (g_view == View::Settings) {
         drawSettings();
-        g_frame.pushSprite(0, 0);
+        presentFrame();
         return;
     }
 
@@ -553,7 +715,7 @@ void renderFrame()
     drawAircraft();
     drawCentre();
     drawDetail();
-    g_frame.pushSprite(0, 0);
+    presentFrame();
 }
 
 
@@ -568,19 +730,24 @@ void handleTouch()
         g_up_since_ms = 0;
     }
 
+    int32_t touch_x = touch.x;
+    int32_t touch_y = touch.y;
+    screenToDrawing(touch.x, touch.y, touch_x, touch_y);
+
     if (touch.down && !g_pressed) {
         g_pressed = true;
         g_long_fired = false;
         g_long_cancelled = false;
-        g_press_x = touch.x;
-        g_press_y = touch.y;
+        g_press_x = (int16_t)touch_x;
+        g_press_y = (int16_t)touch_y;
         g_press_ms = millis();
+        g_last_touch_ms = g_press_ms;
         return;
     }
 
     if (touch.down && g_pressed) {
-        if (abs(touch.x - g_press_x) > kLongPressSlopPx ||
-            abs(touch.y - g_press_y) > kLongPressSlopPx) {
+        if (abs(touch_x - g_press_x) > kLongPressSlopPx ||
+            abs(touch_y - g_press_y) > kLongPressSlopPx) {
             g_long_cancelled = true;
         }
         // Hold anywhere on the radar to open settings. This replaced dragging
@@ -621,9 +788,9 @@ void handleTouch()
             return;
         }
 
+        float x_nm, y_nm;
+        fromScreen(g_press_x, g_press_y, x_nm, y_nm);
         const float s = scale();
-        const float x_nm = (float)(g_press_x - kCentre) / s;
-        const float y_nm = (float)(kCentre - g_press_y) / s;
 
         uint32_t hit = 0;
         {
@@ -657,6 +824,9 @@ bool radarBegin()
         return false;
     }
 
+    // The pivot for the rotated push; both sprites are always drawn upright.
+    g_frame.setPivot((float)kCentre, (float)kCentre);
+    display.setPivot((float)kCentre, (float)kCentre);
     g_ready = true;
     g_grid_dirty = true;
     app::logf("[radar] two %dx%d sprites in PSRAM", hw::kScreenWidth, hw::kScreenHeight);
@@ -681,5 +851,6 @@ void radarPause(bool paused)  { g_paused = paused; }
 bool radarPaused()            { return g_paused; }
 void radarSetRefreshMs(uint16_t ms) { g_refresh_ms = constrain(ms, (uint16_t)40, (uint16_t)2000); }
 uint32_t radarSelected()      { return g_selected_icao; }
+uint32_t radarLastTouchMs()   { return g_last_touch_ms; }
 
 } // namespace ui

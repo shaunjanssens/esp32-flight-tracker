@@ -181,6 +181,18 @@ anyone reconsiders:
   HTTP 429s that came with it: phantom touches at the screen edge were driving the old
   range-drag gesture. That gesture is gone; range lives on the settings page.
 
+### Rotation and the round screen
+
+- **Rotate the composed frame, not both sprites.** The grid is drawn into its own sprite and
+  pushed into the frame sprite; if both carry a rotation the grid gets transformed twice and
+  ends up upright while the aircraft move. Only the final push rotates.
+- **45-degree steps are affordable here only because the screen is round.** `pushRotated`
+  clips the frame's corners, and on this panel those corners are not glass. Cost measured at
+  135 degrees: 29 ms versus 26 ms unrotated, against a 250 ms redraw period.
+- Non-orthogonal angles resample, so text and thin lines soften; quarter turns map pixels
+  one to one and stay sharp. Non-orthogonal angles therefore use `pushRotatedWithAA`, and
+  quarter turns deliberately do not.
+
 ### The feed
 
 - **Do not parse straight from the TLS socket.** ArduinoJson treats a read that returns

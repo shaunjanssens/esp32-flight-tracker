@@ -40,44 +40,161 @@ bool       g_ota_ready = false;
 
 const char kPageStyle[] PROGMEM = R"CSS(
 <meta name=viewport content="width=device-width,initial-scale=1">
+<link rel=stylesheet href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
 :root{color-scheme:dark}
-body{margin:0;padding:24px 16px;background:#0a0e14;color:#dbe4ef;
+body{margin:0;padding:24px 16px 48px;background:#0a0e14;color:#dbe4ef;
      font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 main{max-width:460px;margin:0 auto}
 h1{font-size:20px;letter-spacing:.14em;text-transform:uppercase;color:#38e08a;margin:0 0 4px}
 p.sub{margin:0 0 24px;color:#6e8aa6;font-size:13px}
 fieldset{border:1px solid #1d2a3a;border-radius:10px;margin:0 0 16px;padding:14px 16px}
 legend{padding:0 6px;color:#8aa6c0;font-size:12px;letter-spacing:.1em;text-transform:uppercase}
-label{display:block;margin:10px 0 4px;font-size:13px;color:#9fb3c8}
-input,select{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;
+label{display:block;margin:14px 0 4px;font-size:13px;color:#9fb3c8}
+label:first-of-type{margin-top:4px}
+input[type=text],input[type=password],input[type=number],select{
+     width:100%;box-sizing:border-box;padding:10px;border-radius:8px;
      border:1px solid #24344a;background:#111823;color:#dbe4ef;font-size:15px}
+input[type=range]{width:100%;margin:6px 0}
+.check{display:flex;align-items:center;gap:10px;margin:14px 0 4px;
+     font-size:14px;color:#dbe4ef}
+.check input{width:20px;height:20px;flex:0 0 auto;accent-color:#38e08a;margin:0}
 .row{display:flex;gap:10px}.row>div{flex:1}
-button{width:100%;margin-top:8px;padding:12px;border:0;border-radius:8px;
+button{width:100%;margin-top:14px;padding:12px;border:0;border-radius:8px;
      background:#38e08a;color:#04070d;font-size:16px;font-weight:600}
-button.ghost{background:#1d2a3a;color:#9fb3c8;margin-top:10px}
-.hint{font-size:12px;color:#5c7080;margin-top:6px}
+button.ghost{background:#1d2a3a;color:#9fb3c8}
+.hint{font-size:12px;color:#5c7080;margin:6px 0 0}
 .stat{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #131c28;font-size:14px}
 .stat span:last-child{color:#8aa6c0;font-variant-numeric:tabular-nums}
+#map{height:220px;border-radius:10px;overflow:hidden;margin:10px 0;background:#111823}
+.leaflet-container{background:#111823}
 </style>
 )CSS";
 
-void appendSettingsFields(String &html)
+/** Map picker. Tiles come from the browser's own internet access, not ours. */
+const char kMapScript[] PROGMEM = R"HTML(
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function(){
+  var latEl=document.getElementById('lat'), lonEl=document.getElementById('lon');
+  var box=document.getElementById('map');
+  if(!window.L||!latEl||!box){ if(box) box.style.display='none'; return; }
+  var lat=parseFloat(latEl.value)||51.0, lon=parseFloat(lonEl.value)||4.0;
+  var map=L.map(box,{attributionControl:false}).setView([lat,lon],10);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18}).addTo(map);
+  var pin=L.marker([lat,lon],{draggable:true}).addTo(map);
+  var ring=L.circle([lat,lon],{radius:46300,color:'#38e08a',weight:1,fillOpacity:0.05}).addTo(map);
+  function put(ll){
+    latEl.value=ll.lat.toFixed(5); lonEl.value=ll.lng.toFixed(5);
+    ring.setLatLng(ll);
+  }
+  pin.on('drag',function(){ put(pin.getLatLng()); });
+  map.on('click',function(e){ pin.setLatLng(e.latlng); put(e.latlng); });
+  function fromFields(){
+    var a=parseFloat(latEl.value), b=parseFloat(lonEl.value);
+    if(isNaN(a)||isNaN(b)) return;
+    pin.setLatLng([a,b]); ring.setLatLng([a,b]); map.panTo([a,b]);
+  }
+  latEl.addEventListener('change',fromFields);
+  lonEl.addEventListener('change',fromFields);
+})();
+</script>
+)HTML";
+
+void appendNumber(String &html, const char *name, const char *label, long value,
+                  long minimum, long maximum, const char *hint = nullptr)
+{
+    html += F("<label for=");
+    html += name;
+    html += F(">");
+    html += label;
+    html += F("</label><input id=");
+    html += name;
+    html += F(" name=");
+    html += name;
+    html += F(" type=number min=");
+    html += String(minimum);
+    html += F(" max=");
+    html += String(maximum);
+    html += F(" value='");
+    html += String(value);
+    html += F("'>");
+    if (hint != nullptr) {
+        html += F("<p class=hint>");
+        html += hint;
+        html += F("</p>");
+    }
+}
+
+void appendCheckbox(String &html, const char *name, const char *label, bool checked)
+{
+    html += F("<div class=check><input type=checkbox id=");
+    html += name;
+    html += F(" name=");
+    html += name;
+    html += F(" value=1");
+    html += checked ? F(" checked") : F("");
+    html += F("><label for=");
+    html += name;
+    html += F(" style='margin:0;color:inherit;font-size:14px'>");
+    html += label;
+    html += F("</label></div>");
+}
+
+/** `options` is a NULL-terminated list; the value posted is the index. */
+void appendSelect(String &html, const char *name, const char *label,
+                  const char *const *options, size_t count, size_t selected,
+                  const char *hint = nullptr)
+{
+    html += F("<label for=");
+    html += name;
+    html += F(">");
+    html += label;
+    html += F("</label><select id=");
+    html += name;
+    html += F(" name=");
+    html += name;
+    html += F(">");
+    for (size_t i = 0; i < count; i++) {
+        html += F("<option value=");
+        html += String(i);
+        if (i == selected) {
+            html += F(" selected");
+        }
+        html += F(">");
+        html += options[i];
+        html += F("</option>");
+    }
+    html += F("</select>");
+    if (hint != nullptr) {
+        html += F("<p class=hint>");
+        html += hint;
+        html += F("</p>");
+    }
+}
+
+void appendPositionFields(String &html)
 {
     const app::Settings &settings = app::settings();
-    html += F("<fieldset><legend>Home position</legend>");
-    html += F("<div class=row><div><label>Latitude</label>"
-              "<input name=lat id=lat type=number step=0.00001 min=-90 max=90 value='");
+    html += F("<fieldset><legend>Home position</legend>"
+              "<div class=row>"
+              "<div><label for=lat>Latitude</label>"
+              "<input id=lat name=lat type=number step=0.00001 min=-90 max=90 value='");
     html += String(settings.home_lat, 5);
-    html += F("'></div><div><label>Longitude</label>"
-              "<input name=lon id=lon type=number step=0.00001 min=-180 max=180 value='");
+    html += F("'></div><div><label for=lon>Longitude</label>"
+              "<input id=lon name=lon type=number step=0.00001 min=-180 max=180 value='");
     html += String(settings.home_lon, 5);
-    html += F("'></div></div>"
-              "<button type=button class=ghost onclick='useLocation()'>Use my browser location</button>"
-              "<p class=hint>The radar is drawn around this point. Five decimals is about a metre.</p>"
-              "</fieldset>");
+    html += F("'></div></div><div id=map></div>"
+              "<p class=hint>Drag the pin or tap the map. The circle is roughly 25 nm. "
+              "Needs internet in this browser; the fields work without it.</p></fieldset>");
+}
 
-    html += F("<fieldset><legend>Radar</legend><label>Range</label><select name=radius>");
+void appendRadarFields(String &html)
+{
+    const app::Settings &settings = app::settings();
+
+    html += F("<fieldset><legend>Radar</legend><label for=radius>Range</label>"
+              "<select id=radius name=radius>");
     for (size_t i = 0; i < app::kRadiusPresetCount; i++) {
         html += F("<option value=");
         html += String(app::kRadiusPresets[i]);
@@ -88,57 +205,94 @@ void appendSettingsFields(String &html)
         html += String(app::kRadiusPresets[i]);
         html += F(" nm</option>");
     }
-    html += F("</select><label>Data source</label><select name=provider>");
-    html += (settings.provider == app::Provider::AdsbLol)
-        ? F("<option value=0 selected>adsb.lol</option><option value=1>adsb.fi</option>")
-        : F("<option value=0>adsb.lol</option><option value=1 selected>adsb.fi</option>");
-    html += F("</select></fieldset>");
+    html += F("</select>");
 
-    html += F("<fieldset><legend>Display</legend><div class=row>"
-              "<div><label>Day brightness %</label><input name=day type=number min=5 max=100 value='");
-    html += String(settings.day_brightness);
-    html += F("'></div><div><label>Night brightness %</label>"
-              "<input name=night type=number min=0 max=100 value='");
-    html += String(settings.night_brightness);
-    html += F("'></div></div><div class=row>"
-              "<div><label>Night from (h)</label><input name=nstart type=number min=0 max=23 value='");
-    html += String(settings.night_start_hour);
-    html += F("'></div><div><label>Night until (h)</label>"
-              "<input name=nend type=number min=0 max=23 value='");
-    html += String(settings.night_end_hour);
-    html += F("'></div></div>"
-              "'></div></div>"
-              "<label>Redraw period (ms)</label>"
-              "<input name=refresh type=number min=40 max=2000 value='");
-    html += String(settings.refresh_ms);
-    html += F("'><p class=hint>Every redraw composes and pushes a whole frame. "
-              "250 ms is 4 fps, which is smooth enough for aircraft.</p>"
-              "<label>Pixel clock (MHz)</label>"
-              "<input name=pclk type=number min=8 max=30 value='");
-    html += String(settings.pclk_mhz);
-    html += F("'><p class=hint>Refresh rate is pclk/(548x499): 16 MHz is 58 Hz, 20 is "
-              "73 Hz, 24 is 88 Hz. Applied on restart.</p></fieldset>");
+    html += F("<label for=north>Compass rotation: <span id=northval>");
+    html += String(settings.north_offset_deg);
+    html += F("</span>&deg;</label>"
+              "<input id=north name=north type=range min=0 max=359 step=1 value='");
+    html += String(settings.north_offset_deg);
+    html += F("' oninput=\"document.getElementById('northval').textContent=this.value\">"
+              "<p class=hint>0 puts north at the top. Set it to match how the device sits "
+              "on your desk - 270 makes north point left.</p>");
+
+    appendCheckbox(html, "hidegnd", "Hide aircraft on the ground", settings.hide_ground);
+    appendNumber(html, "maxfl", "Hide above flight level", settings.max_flight_level, 0, 600,
+                 "0 means no limit. FL250 hides high overflights. "
+                 "Emergency squawks are never hidden.");
+
+    static const char *kTrailNames[] = {"Off", "Selected aircraft only", "All aircraft"};
+    appendSelect(html, "trails", "Trails", kTrailNames, 3, settings.trail_mode);
+
+    appendNumber(html, "labels", "Labelled aircraft (nearest N)", settings.label_count, 0, 24);
+    appendCheckbox(html, "labelalt", "Show altitude under the callsign",
+                   settings.label_altitude);
+
+    static const char *kUnitNames[] = {"Aviation (nm, ft, kt)", "Metric (km, m, km/h)"};
+    appendSelect(html, "metric", "Units", kUnitNames, 2, settings.metric ? 1 : 0);
+
+    static const char *kProviderNames[] = {"adsb.lol", "adsb.fi"};
+    appendSelect(html, "provider", "Data source", kProviderNames, 2,
+                 settings.provider == app::Provider::AdsbFi ? 1 : 0,
+                 "Whichever is picked, the device falls back to the other one after "
+                 "repeated failures.");
+    html += F("</fieldset>");
 }
 
-const char kGeoScript[] PROGMEM = R"JS(
-<script>
-function useLocation(){
-  if(!navigator.geolocation){alert('This browser has no geolocation.');return}
-  navigator.geolocation.getCurrentPosition(function(p){
-    document.getElementById('lat').value=p.coords.latitude.toFixed(5);
-    document.getElementById('lon').value=p.coords.longitude.toFixed(5);
-  },function(e){alert('Location failed: '+e.message)},{enableHighAccuracy:true});
+void appendDisplayFields(String &html)
+{
+    const app::Settings &settings = app::settings();
+    html += F("<fieldset><legend>Display</legend>");
+
+    static const char *kRotationNames[] = {"0&deg;", "45&deg;", "90&deg;", "135&deg;",
+                                          "180&deg;", "225&deg;", "270&deg;", "315&deg;"};
+    appendSelect(html, "rot", "Screen rotation", kRotationNames, 8,
+                 (settings.display_rotation_deg % 360) / 45,
+                 "Rotates the whole face, text included, so the USB port can sit "
+                 "wherever your case needs it. The corners it clips are outside the "
+                 "round glass anyway.");
+
+    html += F("<div class=row><div>");
+    appendNumber(html, "day", "Day brightness %", settings.day_brightness, 5, 100);
+    html += F("</div><div>");
+    appendNumber(html, "night", "Night brightness %", settings.night_brightness, 0, 100);
+    html += F("</div></div>");
+
+    appendCheckbox(html, "nightdim", "Dim the screen at night", settings.night_dimming);
+
+    html += F("<div class=row><div>");
+    appendNumber(html, "nstart", "Night from (hour)", settings.night_start_hour, 0, 23);
+    html += F("</div><div>");
+    appendNumber(html, "nend", "Night until (hour)", settings.night_end_hour, 0, 23);
+    html += F("</div></div>"
+              "<p class=hint>0% night brightness turns the backlight off entirely. "
+              "A touch restores full brightness for 30 s.</p>");
+
+    appendNumber(html, "refresh", "Redraw period (ms)", settings.refresh_ms, 40, 2000,
+                 "Every redraw composes and pushes a whole frame. 250 ms is 4 fps, "
+                 "smooth enough for aircraft.");
+    appendNumber(html, "pclk", "Pixel clock (MHz)", settings.pclk_mhz, 8, 30,
+                 "8 is the default and the safe one. Higher makes the panel read PSRAM "
+                 "faster than it can deliver, and the picture tears. Applied on restart.");
+    html += F("</fieldset>");
 }
-</script>
-)JS";
+
+void appendSettingsFields(String &html)
+{
+    appendPositionFields(html);
+    appendRadarFields(html);
+    appendDisplayFields(html);
+}
 
 void handleSetupPage()
 {
-    String html = F("<!doctype html><title>Flight Tracker setup</title>");
+    String html = F("<!doctype html><html><head><meta charset=utf-8>"
+                    "<title>Flight Tracker setup</title>");
     html += FPSTR(kPageStyle);
-    html += F("<main><h1>Flight Tracker</h1>"
+    html += F("</head><body><main><h1>Flight Tracker</h1>"
               "<p class=sub>First-time setup</p><form method=POST action=/save>"
-              "<fieldset><legend>Wi-Fi</legend><label>Network</label><input name=ssid list=nets value='");
+              "<fieldset><legend>Wi-Fi</legend><label for=ssid>Network</label>"
+              "<input id=ssid name=ssid list=nets value='");
     html += WiFi.SSID();
     html += F("'><datalist id=nets>");
 
@@ -148,11 +302,14 @@ void handleSetupPage()
         html += WiFi.SSID(i);
         html += F("'>");
     }
-    html += F("</datalist><label>Password</label><input name=pass type=password>"
-              "<p class=hint>2.4 GHz only — the ESP32-S3 has no 5 GHz radio.</p></fieldset>");
+    html += F("</datalist><label for=pass>Password</label>"
+              "<input id=pass name=pass type=password>"
+              "<p class=hint>2.4 GHz only - the ESP32-S3 has no 5 GHz radio.</p>"
+              "</fieldset>");
     appendSettingsFields(html);
     html += F("<button type=submit>Save and restart</button></form></main>");
-    html += FPSTR(kGeoScript);
+    html += FPSTR(kMapScript);
+    html += F("</body></html>");
     g_server.send(200, "text/html", html);
 }
 
@@ -162,15 +319,15 @@ void handleSettingsPage()
     const uint32_t age_s = stats.last_success_ms == 0
         ? 0 : (millis() - stats.last_success_ms) / 1000;
 
-    String html = F("<!doctype html><title>Flight Tracker</title>");
+    String html = F("<!doctype html><html><head><meta charset=utf-8>"
+                    "<title>Flight Tracker</title>");
     html += FPSTR(kPageStyle);
-    html += F("<main><h1>Flight Tracker</h1><p class=sub>");
+    html += F("</head><body><main><h1>Flight Tracker</h1><p class=sub>");
     html += g_network;
-    html += F(" · ");
+    html += F(" &middot; ");
     html += g_address;
-    html += F("</p><fieldset><legend>Feed</legend>");
-
-    html += F("<div class=stat><span>Aircraft shown</span><span>");
+    html += F("</p><fieldset><legend>Feed</legend>"
+              "<div class=stat><span>Aircraft shown</span><span>");
     html += String(stats.accepted);
     html += F("</span></div><div class=stat><span>Reported in range</span><span>");
     html += String(stats.reported_total);
@@ -187,9 +344,15 @@ void handleSettingsPage()
     html += F("</span></div></fieldset><form method=POST action=/save>");
     appendSettingsFields(html);
     html += F("<button type=submit>Save</button></form>"
-              "<form method=POST action=/forget onsubmit=\"return confirm('Forget Wi-Fi and restart?')\">"
-              "<button class=ghost type=submit>Forget Wi-Fi</button></form></main>");
-    html += FPSTR(kGeoScript);
+              "<form method=POST action=/reboot><button class=ghost type=submit>"
+              "Restart</button></form>"
+              "<form method=POST action=/forget onsubmit=\"return confirm("
+              "'Forget Wi-Fi and restart into setup?')\">"
+              "<button class=ghost type=submit>Forget Wi-Fi</button></form>"
+              "<p class=hint>Aircraft data from adsb.lol and adsb.fi, routes from "
+              "adsbdb.com. Data is ODbL.</p></main>");
+    html += FPSTR(kMapScript);
+    html += F("</body></html>");
     g_server.send(200, "text/html", html);
 }
 
@@ -219,6 +382,30 @@ void handleSave()
     if (g_server.hasArg("provider")) {
         settings.provider = g_server.arg("provider").toInt() == 1
             ? app::Provider::AdsbFi : app::Provider::AdsbLol;
+    }
+    // Checkboxes only appear in the POST when ticked, and the settings form
+    // always posts every section, so absence means "off".
+    settings.hide_ground = g_server.hasArg("hidegnd");
+    settings.night_dimming = g_server.hasArg("nightdim");
+    settings.label_altitude = g_server.hasArg("labelalt");
+    if (g_server.hasArg("maxfl")) {
+        settings.max_flight_level = (uint16_t)constrain(g_server.arg("maxfl").toInt(), 0, 600);
+    }
+    if (g_server.hasArg("trails")) {
+        settings.trail_mode = (uint8_t)constrain(g_server.arg("trails").toInt(), 0, 2);
+    }
+    if (g_server.hasArg("labels")) {
+        settings.label_count = (uint8_t)constrain(g_server.arg("labels").toInt(), 0, 24);
+    }
+    if (g_server.hasArg("rot")) {
+        settings.display_rotation_deg =
+            (uint16_t)(constrain(g_server.arg("rot").toInt(), 0, 7) * 45);
+    }
+    if (g_server.hasArg("metric")) {
+        settings.metric = g_server.arg("metric").toInt() == 1;
+    }
+    if (g_server.hasArg("north")) {
+        settings.north_offset_deg = (uint16_t)constrain(g_server.arg("north").toInt(), 0, 359);
     }
     if (g_server.hasArg("day")) {
         settings.day_brightness = (uint8_t)constrain(g_server.arg("day").toInt(), 5, 100);
