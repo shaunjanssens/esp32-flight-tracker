@@ -54,6 +54,18 @@ uint32_t g_next_draw_ms = 0;
 uint32_t g_selected_icao = 0;
 uint32_t g_range_hint_until = 0;
 
+/**
+ * Network details on the glass.
+ *
+ * Shown for the first 20 s of every boot, and on demand by tapping the centre
+ * dot. Without it the only way to find the device is mDNS, which is exactly
+ * what fails on the networks where you most need to know its address.
+ */
+uint32_t g_info_until = 0;
+constexpr uint32_t kInfoBootMs = 20000;
+constexpr uint32_t kInfoTapMs = 20000;
+constexpr int32_t  kCentreTapRadius = 40;
+
 // Touch gesture state
 bool  g_pressed = false;
 bool  g_bezel_drag = false;
@@ -267,6 +279,33 @@ void drawAircraft()
  * information the picture itself carries. What is left is the state you cannot
  * infer by looking - the feed being stale, or the device waiting for setup.
  */
+/** SSID, address and signal, so the device can be reached without mDNS. */
+void drawNetworkInfo()
+{
+    const bool booting = millis() < kInfoBootMs;
+    if (!booting && (g_info_until == 0 || millis() > g_info_until)) {
+        return;
+    }
+
+    const char *network = net::wifiNetwork();
+    const char *address = net::wifiAddress();
+
+    g_frame.setTextDatum(textdatum_t::middle_center);
+    g_frame.setFont(&fonts::FreeSansBold12pt7b);
+    g_frame.setTextColor(kColourHome);
+    g_frame.drawString(address[0] != '\0' ? address : "no address", kCentre, kCentre - 96);
+
+    g_frame.setFont(&fonts::FreeSans9pt7b);
+    g_frame.setTextColor(kColourDim);
+    char line[64];
+    if (net::wifiState() == net::WifiState::PortalActive) {
+        snprintf(line, sizeof(line), "join %s to set up", network);
+    } else {
+        snprintf(line, sizeof(line), "%s   %d dBm", network, net::wifiRssi());
+    }
+    g_frame.drawString(line, kCentre, kCentre - 72);
+}
+
 void drawCentre()
 {
     const net::FeedStats feed = net::adsbStats();
@@ -291,23 +330,25 @@ void drawCentre()
     g_frame.drawString(status, kCentre, kCentre + 34);
 }
 
-// The detail panel's vertical extent. Its sides follow the screen edge.
-constexpr int32_t kPanelTop = 290;
-constexpr int32_t kPanelBottom = 430;
-constexpr int32_t kPanelInset = 12;      // gap between panel edge and glass
+/**
+ * The detail panel is the circular segment below a chord: its sides and bottom
+ * are the screen edge itself, so the background runs out to the glass with no
+ * sliver of radar left showing around it.
+ */
+constexpr int32_t kPanelTop = 288;
+constexpr int32_t kScreenRadius = 240;
 
-/** Half-width of the panel at row `y`, following the circle. */
+/** Half-width of the panel at row `y`, following the screen edge exactly. */
 int32_t panelHalfWidth(int32_t y)
 {
     const float dy = (float)(y - kCentre);
-    const float radius = (float)(kPlotRadius + 30 - kPanelInset);
-    const float squared = radius * radius - dy * dy;
+    const float squared = (float)(kScreenRadius * kScreenRadius) - dy * dy;
     return squared <= 0.0f ? 0 : (int32_t)sqrtf(squared);
 }
 
 bool insidePanel(int32_t x, int32_t y)
 {
-    if (y < kPanelTop || y > kPanelBottom) {
+    if (y < kPanelTop) {
         return false;
     }
     return abs(x - kCentre) <= panelHalfWidth(y);
@@ -341,17 +382,17 @@ void drawDetail()
         return;
     }
 
-    for (int32_t y = kPanelTop; y <= kPanelBottom; y++) {
+    for (int32_t y = kPanelTop; y < hw::kScreenHeight; y++) {
         const int32_t half = panelHalfWidth(y);
         if (half <= 0) {
             continue;
         }
-        // Round off the top corners so it reads as a panel, not a slab.
-        const int32_t corner = kPanelTop + 10 - y;
-        const int32_t trim = corner > 0 ? (int32_t)(10 - sqrtf((float)(100 - (10 - corner) * (10 - corner)))) : 0;
-        const uint16_t colour = (y == kPanelTop || y == kPanelBottom) ? kColourPanelEdge : kColourPanel;
-        g_frame.drawFastHLine(kCentre - half + trim, y, (half - trim) * 2, colour);
+        g_frame.drawFastHLine(kCentre - half, y, half * 2, kColourPanel);
     }
+    // A bright chord along the top is the only edge it needs; the other three
+    // sides are the bezel.
+    const int32_t top_half = panelHalfWidth(kPanelTop);
+    g_frame.drawFastHLine(kCentre - top_half, kPanelTop, top_half * 2, kColourPanelEdge);
 
     const net::RouteInfo *route = net::routeLookup(copy.icao, copy.flight);
 
@@ -405,6 +446,7 @@ void renderFrame()
     g_grid.pushSprite(&g_frame, 0, 0);
     drawAircraft();
     drawCentre();
+    drawNetworkInfo();
     drawDetail();
     g_frame.pushSprite(0, 0);
 }
@@ -475,6 +517,16 @@ void handleTouch()
         // aircraft underneath it.
         if (g_selected_icao != 0 && insidePanel(g_press_x, g_press_y)) {
             g_selected_icao = 0;
+            return;
+        }
+
+        // Tapping the home dot summons the network details.
+        const int32_t dx = g_press_x - kCentre;
+        const int32_t dy = g_press_y - kCentre;
+        if (dx * dx + dy * dy <= kCentreTapRadius * kCentreTapRadius) {
+            const bool showing = millis() < kInfoBootMs ||
+                                 (g_info_until != 0 && millis() < g_info_until);
+            g_info_until = showing ? 0 : millis() + kInfoTapMs;
             return;
         }
 
