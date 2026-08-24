@@ -1,150 +1,98 @@
-# esp32-flight-tracker
+# ESP32 Flight Tracker
 
-A desk radar for aircraft overhead, on a 2.1" round touchscreen.
+Live ADS-B aircraft on a 2.1&Prime; round touchscreen: a north-up polar plot with range
+rings, cardinal marks, trails, and tap-for-detail. No map tiles, no receiver, no antenna —
+aircraft data comes from community feeds over Wi-Fi.
 
-Your home position sits at the centre. Live aircraft appear as chevrons at their real bearing
-and distance, trailing the last five minutes of their track behind them. No map, no tiles —
-just range rings, N/E/S/W markers, and the planes. Tap one to see who it is and where it's
-going. Drag around the bezel to change the range.
+Runs on the **Waveshare ESP32-S3-Touch-LCD-2.1** (ESP32-S3R8, 8 MB octal PSRAM, 16 MB flash).
 
-Data comes straight from community ADS-B feeds over your Wi-Fi. No receiver hardware, no
-server of your own, no API keys.
+## Install
 
-> **Status: in development.** The design is settled and the hardware is confirmed — see
-> [PLAN.md](PLAN.md) for the full build plan. There is no flashable release yet; the
-> [Flashing](#flashing) section below describes how it will work and what already works today.
+**[Flash it from your browser →](https://shaunjanssens.github.io/esp32-flight-tracker/)**
 
-## Hardware
+Chrome or Edge on a desktop, and a USB cable. No toolchain, no IDE. Safari and Firefox have
+no Web Serial support and cannot flash.
 
-One board, nothing to solder:
+If the board is not detected, hold **BOOT** while plugging the cable in, then release it.
+After flashing, **unplug and replug**: this board has no USB-to-serial chip, so the reset
+esptool performs cannot clear the ROM's download-mode latch, and it will sit at "waiting for
+download" until it is power-cycled.
 
-**[Waveshare ESP32-S3-Touch-LCD-2.1](https://www.waveshare.com/wiki/ESP32-S3-Touch-LCD-2.1)**
+## First run
 
-| | |
+1. The device starts its own Wi-Fi network, `FlightTracker-XXXX`.
+2. Join it; the setup page opens by itself. Enter your Wi-Fi and press **Connect**.
+3. It restarts onto your network. Drop a pin on the map for your home position — the radar
+   is drawn around that point.
+
+Everything after that is over Wi-Fi. The cable is only needed once.
+
+## Using it
+
+| Gesture | What happens |
 |---|---|
-| MCU | ESP32-S3R8, dual-core Xtensa LX7 @ 240 MHz, Wi-Fi + BLE 5 |
-| Memory | 512 KB SRAM, 8 MB PSRAM (octal), 16 MB flash |
-| Display | 2.1" round IPS, 480×480, ST7701 over 16-bit RGB parallel |
-| Touch | CST820 capacitive, I²C — **single touch only** |
-| Also onboard | QMI8658 6-axis IMU, PCF85063 RTC, TCA9554 IO expander, TF slot, battery charging |
+| Tap an aircraft | Detail panel: callsign, route, aircraft type, registration, altitude, speed, distance |
+| Tap the panel | Dismiss it |
+| Long press | On-device settings: range, and the address for everything else |
 
-The single-touch controller is why range is changed with a bezel drag rather than a pinch —
-the panel physically cannot report two fingers.
+Blips are coloured by altitude band and point along their track. Trails show roughly five
+minutes of history. Aircraft squawking **7500, 7600 or 7700** are drawn in red with a ring
+and are never hidden by any filter.
 
-You will also need a USB-C cable that carries data, and 2.4 GHz Wi-Fi (the ESP32-S3 has no
-5 GHz radio).
+## Settings
 
-## What it does
+Everything lives at `http://flighttracker.local/` (or the device's IP, shown on the
+on-device settings page).
 
-**Radar face**
-- North-up polar plot: range rings at ¼, ½, ¾ and full range, labelled in nm
-- N / E / S / W bezel markers with minor ticks every 30°
-- Aircraft drawn as chevrons rotated to their true track, coloured by altitude band
-- Callsign + flight level labelled on the nearest few, so the face stays readable when busy
-- Centre shows local time, aircraft count, and the age of the last update — which goes amber,
-  then red, if the feed stalls
-- Positions interpolate between updates from ground speed and track, so blips glide instead
-  of hopping every five seconds
+- **Position** — latitude and longitude, with a map picker
+- **Radar** — range, compass rotation, hide aircraft on the ground, hide above a flight
+  level, trails, how many aircraft get labels, units, data source
+- **Display** — screen rotation in 45° steps, day and night brightness, night schedule,
+  redraw period, pixel clock
 
-**Trails**
-- Five minutes of history per aircraft, fading out along its length
+Two settings are worth explaining:
 
-**Tap an aircraft**
-- Callsign and airline
-- Route: origin → destination, with airport codes and cities
-- Aircraft type, registration, and registered operator
-- Altitude with climb/descent rate, ground speed, distance, and bearing
-- Details are fetched only when you tap, then cached
+**Compass rotation** turns the rose without moving the device: set it to 270 and north
+points left, so the plot matches how the thing sits on your desk.
 
-**Range control**
-- Drag a finger around the outer bezel to step through 5 / 10 / 25 / 50 / 100 nm
-- Your choice is remembered across reboots
+**Screen rotation** turns the whole face, text included, in 45° steps — the USB port on this
+board is at 135°, and a printed case usually wants it at the bottom. The screen is round, so
+rotating the frame only throws away corners that were never visible. Quarter turns stay
+pixel-sharp; other angles resample and soften slightly.
 
-**Setup and upkeep**
-- Browser-based flashing and Wi-Fi provisioning — no IDE needed to install it
-- Captive-portal fallback if provisioning doesn't take
-- Small web UI on your LAN for settings, plus over-the-air firmware updates
-- Backlight dims on a schedule at night; any touch wakes it to full brightness
-- IMU detects when the device is turned, and re-orients the detail panel text
+## Updating
 
-## Flashing
-
-### Install from the browser *(planned, once the first release ships)*
-
-The intended path — no toolchain, no checkout:
-
-1. Plug the board into your computer with a USB-C data cable.
-2. Open the install page (link will be published here) in **Chrome or Edge** on a desktop.
-   Safari and Firefox do not implement WebSerial and cannot flash.
-3. Click **Install**, pick the serial port that appears, and wait.
-4. When it finishes, the same page offers to send your Wi-Fi credentials over the serial
-   connection (Improv). Enter your network and password there.
-5. The device connects and asks for your home latitude and longitude. There's a button to fill
-   them from your browser's location.
-
-If Wi-Fi provisioning doesn't complete, the device raises its own access point named
-`FlightTracker-XXXX`. Join it and a setup page opens automatically.
-
-### Build and flash it yourself *(works today)*
-
-Requires [PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/index.html).
+Over the air, once it is on your network:
 
 ```bash
-git clone https://github.com/shaunjanssens/esp32-flight-tracker.git
-cd esp32-flight-tracker
-pio run -t upload
+pio run -e ota -t upload                          # to flighttracker.local
+pio run -e ota -t upload --upload-port 192.168.1.x  # or by address
 ```
 
-The first build downloads the ESP32 toolchain and libraries — a few hundred megabytes and
-several minutes. Later builds are quick.
-
-To watch the serial output:
+## Building from source
 
 ```bash
-pio device monitor
+pio run -e device                                    # build
+pio run -e device -t upload --upload-port /dev/cu.usbmodemXXXX   # first flash, over USB
 ```
 
-The board exposes a native USB serial port (`303A:1001`, "USB JTAG/serial debug unit") and
-resets into the bootloader on its own, so there are no buttons to hold while flashing.
+Diagnostics without a cable:
 
-### Updating later
+```bash
+curl -s http://flighttracker.local/api/status   # uptime, memory, feed stats, aircraft table
+curl -s http://flighttracker.local/api/log      # retained log
+```
 
-Once the device is on your network, firmware updates are uploaded through its own web page —
-no cable. Point a browser at `http://flighttracker.local/` (or the device's IP, shown on
-screen during setup) for settings and OTA updates.
-
-## Configuration
-
-Everything is set through the browser and stored on the device; nothing needs recompiling.
-
-| Setting | Notes |
-|---|---|
-| Home latitude / longitude | The centre of the radar. Decimal degrees. |
-| Default range | 5 / 10 / 25 / 50 / 100 nm |
-| Data provider | adsb.lol (default) or adsb.fi |
-| Night dimming | Start and end time, dimmed brightness level |
-| Timezone | Defaults to `Europe/Brussels`, from NTP |
+See [CLAUDE.md](CLAUDE.md) for the architecture, and for a record of what went wrong during
+development and what fixed it — the PSRAM bandwidth limit that governs the pixel clock, the
+download-mode trap, the touch controller's phantom samples. Worth reading before changing
+anything that looks odd; several things that look like mistakes are deliberate.
 
 ## Data sources
 
-This project is a client for infrastructure other people pay for and volunteers feed. Please
-be a good guest: don't lower the poll interval, and don't point a fleet of these at it.
+Aircraft from [adsb.fi](https://adsb.fi) and [adsb.lol](https://adsb.lol), routes and
+aircraft types from [adsbdb.com](https://adsbdb.com). Data is ODbL.
 
-- Aircraft positions: [adsb.lol](https://adsb.lol) (default) or [adsb.fi](https://adsb.fi)
-  — both free and unauthenticated, both fed by volunteer receivers.
-- Routes and aircraft details: [adsbdb](https://www.adsbdb.com/), queried only when you tap
-  an aircraft, and cached.
-
-Position data is licensed **ODbL**; the device carries the attribution on its about screen.
-
-Nothing here decodes radio. If you'd rather feed the network than only consume it, an RTL-SDR
-and [these instructions](https://adsb.lol/docs/feeding/) will get you a receiver — and a
-future version can read from your own `dump1090` instead of the internet.
-
-## Documentation
-
-- [PLAN.md](PLAN.md) — architecture, UI design, memory budgets, risks, and build order
-
-## License
-
-Not yet chosen — MIT is the intent, but no `LICENSE` file has been added.
+These are volunteer-funded and free to use. The firmware sends a descriptive User-Agent,
+never polls faster than every 5 seconds, scales the interval with the requested radius, and
+stands down for a minute on an HTTP 429. Please keep it that way.

@@ -305,7 +305,12 @@ void handleSetupPage()
     html += F("</datalist><label for=pass>Password</label>"
               "<input id=pass name=pass type=password>"
               "<p class=hint>2.4 GHz only - the ESP32-S3 has no 5 GHz radio.</p>"
-              "</fieldset>");
+              "</fieldset>"
+              // Submitting from here is the whole job for most people; the rest
+              // of the page is tuning they can do later over the network.
+              "<button type=submit>Connect</button>"
+              "<p class=hint style='text-align:center'>Everything below is optional and can "
+              "be changed later from your browser.</p>");
     appendSettingsFields(html);
     html += F("<button type=submit>Save and restart</button></form></main>");
     html += FPSTR(kMapScript);
