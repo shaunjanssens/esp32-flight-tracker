@@ -1,0 +1,74 @@
+name: Build firmware and publish install page
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Pages deployment needs these; contents stays read-only.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time, and let a newer push win.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The toolchain is a few hundred MB; caching turns a 5 minute build into
+      # about one.
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build firmware
+        run: pio run -e device
+
+      - name: Stage the install page
+        run: |
+          # firmware.factory.bin is bootloader + partitions + boot_app0 + app
+          # merged at offset 0, which is what ESP Web Tools flashes.
+          cp .pio/build/device/firmware.factory.bin web/install/firmware.factory.bin
+          version="$(git describe --tags --always --dirty)"
+          sed -i "s/\"version\": \"dev\"/\"version\": \"${version}\"/" web/install/manifest.json
+          echo "Published version ${version}"
+          ls -la web/install
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/install
+
+      # Also keep the binary on the run itself, for flashing without the page.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: .pio/build/device/firmware.factory.bin
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

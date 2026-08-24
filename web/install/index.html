@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 Flight Tracker &mdash; install</title>
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js"></script>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;padding:48px 20px 64px;background:#04070d;color:#dbe4ef;
+     font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+main{max-width:620px;margin:0 auto}
+h1{font-size:28px;letter-spacing:.12em;text-transform:uppercase;color:#38e08a;margin:0 0 6px}
+p.lede{margin:0 0 32px;color:#8aa6c0}
+h2{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:#8aa6c0;
+   margin:36px 0 10px;padding-bottom:6px;border-bottom:1px solid #1d2a3a}
+ul{padding-left:20px;margin:10px 0}
+li{margin:6px 0}
+code{background:#111823;border:1px solid #1d2a3a;border-radius:4px;padding:1px 6px;
+     font-size:14px;color:#9fe8c4}
+.install{background:#0c121c;border:1px solid #1d2a3a;border-radius:12px;
+     padding:24px;text-align:center;margin:24px 0}
+esp-web-install-button{--esp-tools-button-color:#04070d;
+     --esp-tools-button-text-color:#04070d}
+esp-web-install-button[install-unsupported]{display:block}
+.unsupported{color:#e0603c;font-size:14px}
+.hint{color:#5c7080;font-size:14px}
+.grid{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;font-size:15px;
+     margin:12px 0}
+.grid dt{color:#6e8aa6}
+.grid dd{margin:0}
+a{color:#38e08a}
+footer{margin-top:48px;color:#5c7080;font-size:13px;border-top:1px solid #131c28;
+     padding-top:16px}
+</style>
+</head>
+<body>
+<main>
+  <h1>Flight Tracker</h1>
+  <p class="lede">Live aircraft around you on a 480&times;480 round touch screen. Range
+  rings, cardinal marks, trails, and tap an aircraft for its route. No map tiles.</p>
+
+  <div class="install">
+    <esp-web-install-button manifest="manifest.json">
+      <button slot="activate" style="padding:14px 28px;border:0;border-radius:8px;
+        background:#38e08a;color:#04070d;font-size:17px;font-weight:600;cursor:pointer">
+        Connect and install
+      </button>
+      <span slot="unsupported" class="unsupported">
+        This browser can't talk to serial devices. Use Chrome or Edge on a desktop &mdash;
+        Safari and Firefox have no Web Serial support.
+      </span>
+      <span slot="not-allowed" class="unsupported">
+        This page has to be served over HTTPS to access the serial port.
+      </span>
+    </esp-web-install-button>
+    <p class="hint" style="margin-bottom:0">Plug the board in over USB first.</p>
+  </div>
+
+  <h2>Hardware</h2>
+  <dl class="grid">
+    <dt>Board</dt><dd>Waveshare ESP32-S3-Touch-LCD-2.1</dd>
+    <dt>Display</dt><dd>2.1&Prime; round IPS, 480&times;480, ST7701 over RGB</dd>
+    <dt>Memory</dt><dd>8&nbsp;MB octal PSRAM, 16&nbsp;MB flash</dd>
+  </dl>
+  <p class="hint">Nothing else is needed &mdash; no receiver, no antenna. Aircraft data
+  comes from community ADS-B feeds over your Wi-Fi.</p>
+
+  <h2>If the board won't connect</h2>
+  <p>This board has no USB-to-serial chip, so it can be fussy about entering flash mode:</p>
+  <ul>
+    <li>Hold <strong>BOOT</strong>, plug the cable in, then release <strong>BOOT</strong>.</li>
+    <li>After flashing, <strong>unplug and replug</strong> the cable. The reset that
+        esptool performs cannot clear this chip's download-mode latch, so it will sit at
+        &ldquo;waiting for download&rdquo; until it is power-cycled.</li>
+  </ul>
+
+  <h2>First run</h2>
+  <ul>
+    <li>The device starts its own Wi-Fi network called <code>FlightTracker-XXXX</code>.</li>
+    <li>Join it and the setup page opens by itself. Enter your Wi-Fi, then drop a pin on the
+        map for your home position.</li>
+    <li>It restarts onto your network. Long-press the screen for range and the device
+        address; everything else lives at <code>http://flighttracker.local/</code>.</li>
+    <li>Later updates go over Wi-Fi &mdash; the cable is only needed this once.</li>
+  </ul>
+
+  <footer>
+    Aircraft data from <a href="https://adsb.fi">adsb.fi</a> and
+    <a href="https://adsb.lol">adsb.lol</a>, routes from
+    <a href="https://adsbdb.com">adsbdb.com</a>. Data is ODbL.
+    <a href="https://github.com/shaunjanssens/esp32-flight-tracker">Source on GitHub</a>.
+  </footer>
+</main>
+</body>
+</html>

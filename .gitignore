@@ -2,3 +2,4 @@
 .vscode/
 .DS_Store
 *.bin
+web/install/firmware.factory.bin
