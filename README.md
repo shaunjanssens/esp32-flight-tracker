@@ -127,3 +127,12 @@ aircraft types from [adsbdb.com](https://adsbdb.com). Data is ODbL.
 These are volunteer-funded and free to use. The firmware sends a descriptive User-Agent,
 never polls faster than every 5 seconds, scales the interval with the requested radius, and
 stands down for a minute on an HTTP 429. Please keep it that way.
+
+## Licence
+
+[MIT](LICENSE). The libraries it builds on carry their own permissive licences:
+[LovyanGFX](https://github.com/lovyan03/LovyanGFX) (FreeBSD) and
+[ArduinoJson](https://arduinojson.org) (MIT).
+
+Aircraft data is a separate matter from the code: it is ODbL, and belongs to the volunteers
+who feed the networks above.
