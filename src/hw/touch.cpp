@@ -10,6 +10,7 @@ namespace {
 
 bool g_ready = false;
 uint32_t g_failures = 0;
+uint32_t g_rejected = 0;
 
 bool writeRegister(uint8_t reg, uint8_t value)
 {
@@ -61,6 +62,11 @@ bool touchReady()
     return g_ready;
 }
 
+uint32_t touchRejectedSamples()
+{
+    return g_rejected;
+}
+
 bool touchRead(TouchState &state)
 {
     state.down = false;
@@ -77,15 +83,41 @@ bool touchRead(TouchState &state)
     }
     g_failures = 0;
 
-    if (buffer[1] == 0) {
-        return true;            // a valid read, just nothing touching
+    // The finger-count register is 0 or 1 on this controller; anything else is
+    // a corrupt read, not a touch.
+    if (buffer[1] == 0 || buffer[1] > 1) {
+        return true;
+    }
+
+    const int16_t x = (int16_t)(((buffer[2] & 0x0F) << 8) | buffer[3]);
+    const int16_t y = (int16_t)(((buffer[4] & 0x0F) << 8) | buffer[5]);
+
+    /*
+     * Reject bad samples rather than clamping them.
+     *
+     * The CST820 periodically returns out-of-range coordinates - 0x0FFF and
+     * friends. Clamping turned those into a plausible tap at 479,479, which is
+     * the bottom-right corner: on a round panel there is no glass there, and
+     * every phantom tap landed on empty space and cleared the user's selection.
+     * Two guards: the reported point must be on the panel at all, and it must
+     * be inside the circle that physically exists.
+     */
+    if (x < 0 || x >= kScreenWidth || y < 0 || y >= kScreenHeight) {
+        g_rejected++;
+        return true;
+    }
+
+    constexpr int32_t kRadius = kScreenWidth / 2;
+    const int32_t dx = x - kRadius;
+    const int32_t dy = y - kRadius;
+    if (dx * dx + dy * dy > kRadius * kRadius) {
+        g_rejected++;
+        return true;
     }
 
     state.down = true;
-    state.x = (int16_t)(((buffer[2] & 0x0F) << 8) | buffer[3]);
-    state.y = (int16_t)(((buffer[4] & 0x0F) << 8) | buffer[5]);
-    state.x = constrain(state.x, 0, kScreenWidth - 1);
-    state.y = constrain(state.y, 0, kScreenHeight - 1);
+    state.x = x;
+    state.y = y;
     return true;
 }
 

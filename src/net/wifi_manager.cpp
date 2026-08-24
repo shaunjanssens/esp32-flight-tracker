@@ -14,6 +14,7 @@
 #include "model/aircraft.h"
 #include "net/adsb_client.h"
 #include "hw/display.h"
+#include "hw/touch.h"
 #include "ui/radar.h"
 
 /** Defined in main.cpp: arms a radios-off diagnostic boot. */
@@ -278,6 +279,7 @@ void handleStatusApi()
     doc["free_sram"] = ESP.getFreeHeap();
     doc["largest_sram_block"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     doc["free_psram"] = ESP.getFreePsram();
+    doc["touch_rejected"] = hw::touchRejectedSamples();
 
     JsonObject home = doc["home"].to<JsonObject>();
     home["lat"] = settings.home_lat;

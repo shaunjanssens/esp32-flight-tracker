@@ -18,4 +18,7 @@ bool touchRead(TouchState &state);
 
 bool touchReady();
 
+/** Samples discarded as physically impossible; a health counter, not an error. */
+uint32_t touchRejectedSamples();
+
 } // namespace hw

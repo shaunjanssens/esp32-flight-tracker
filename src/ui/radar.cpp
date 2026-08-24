@@ -17,7 +17,6 @@ namespace {
 
 constexpr int32_t kCentre     = 240;
 constexpr int32_t kPlotRadius = 196;
-constexpr int32_t kBezelInner = 200;   // drags starting outside this change range
 constexpr int32_t kTapSlopPx  = 34;
 constexpr float   kDegreesPerStep = 50.0f;
 constexpr size_t  kMaxLabels  = 8;
@@ -52,27 +51,51 @@ bool g_paused = false;
 uint16_t g_refresh_ms = 250;
 uint32_t g_next_draw_ms = 0;
 uint32_t g_selected_icao = 0;
-uint32_t g_range_hint_until = 0;
 
-/**
- * Network details on the glass.
- *
- * Shown for the first 20 s of every boot, and on demand by tapping the centre
- * dot. Without it the only way to find the device is mDNS, which is exactly
- * what fails on the networks where you most need to know its address.
- */
-uint32_t g_info_until = 0;
-constexpr uint32_t kInfoBootMs = 20000;
-constexpr uint32_t kInfoTapMs = 20000;
-constexpr int32_t  kCentreTapRadius = 40;
+
+/** Which face is on screen. */
+enum class View : uint8_t { Radar, Settings };
+View g_view = View::Radar;
 
 // Touch gesture state
 bool  g_pressed = false;
-bool  g_bezel_drag = false;
-float g_bezel_last_angle = 0.0f;
-float g_bezel_accumulated = 0.0f;
+bool  g_long_fired = false;      // this press already opened settings
+bool  g_long_cancelled = false;  // moved too far to count as a long press
 int16_t g_press_x = 0, g_press_y = 0;
 uint32_t g_press_ms = 0;
+
+constexpr uint32_t kLongPressMs = 600;
+constexpr int32_t  kLongPressSlopPx = 16;
+
+/**
+ * The CST820 drops the odd sample while a finger is still down, which turns
+ * one tap into release-press-release. That second tap either lands on the
+ * aircraft again (toggling it off) or on the panel that just opened under the
+ * finger (dismissing it), so a release only counts once the controller has
+ * reported "up" for this long.
+ */
+constexpr uint32_t kReleaseDebounceMs = 60;
+uint32_t g_up_since_ms = 0;
+
+// Settings page geometry
+constexpr int32_t kChipWidth = 76;
+constexpr int32_t kChipHeight = 54;
+constexpr int32_t kChipGap = 10;
+constexpr int32_t kChipTop = 150;
+constexpr int32_t kCloseTop = 372;
+constexpr int32_t kCloseWidth = 160;
+constexpr int32_t kCloseHeight = 54;
+
+/** Screen rect of range preset `index`. */
+void chipRect(size_t index, int32_t &x, int32_t &y, int32_t &w, int32_t &h)
+{
+    const int32_t total = (int32_t)app::kRadiusPresetCount * kChipWidth +
+                          ((int32_t)app::kRadiusPresetCount - 1) * kChipGap;
+    x = kCentre - total / 2 + (int32_t)index * (kChipWidth + kChipGap);
+    y = kChipTop;
+    w = kChipWidth;
+    h = kChipHeight;
+}
 
 uint16_t altitudeColour(const model::Aircraft &aircraft)
 {
@@ -279,33 +302,6 @@ void drawAircraft()
  * information the picture itself carries. What is left is the state you cannot
  * infer by looking - the feed being stale, or the device waiting for setup.
  */
-/** SSID, address and signal, so the device can be reached without mDNS. */
-void drawNetworkInfo()
-{
-    const bool booting = millis() < kInfoBootMs;
-    if (!booting && (g_info_until == 0 || millis() > g_info_until)) {
-        return;
-    }
-
-    const char *network = net::wifiNetwork();
-    const char *address = net::wifiAddress();
-
-    g_frame.setTextDatum(textdatum_t::middle_center);
-    g_frame.setFont(&fonts::FreeSansBold12pt7b);
-    g_frame.setTextColor(kColourHome);
-    g_frame.drawString(address[0] != '\0' ? address : "no address", kCentre, kCentre - 96);
-
-    g_frame.setFont(&fonts::FreeSans9pt7b);
-    g_frame.setTextColor(kColourDim);
-    char line[64];
-    if (net::wifiState() == net::WifiState::PortalActive) {
-        snprintf(line, sizeof(line), "join %s to set up", network);
-    } else {
-        snprintf(line, sizeof(line), "%s   %d dBm", network, net::wifiRssi());
-    }
-    g_frame.drawString(line, kCentre, kCentre - 72);
-}
-
 void drawCentre()
 {
     const net::FeedStats feed = net::adsbStats();
@@ -369,9 +365,11 @@ void drawDetail()
 
     model::Aircraft copy;
     bool found = false;
+    bool locked = false;
     {
         model::StoreGuard guard(20);
-        if (guard) {
+        locked = (bool)guard;
+        if (locked) {
             if (const model::Aircraft *aircraft = model::store().find(g_selected_icao)) {
                 copy = *aircraft;
                 found = true;
@@ -379,6 +377,14 @@ void drawDetail()
         }
     }
     if (!found) {
+        // Distinguish a lock we could not take from an aircraft that left the
+        // table: the first blanks the panel for a frame, the second for good.
+        static uint32_t last_complaint_ms = 0;
+        if (millis() - last_complaint_ms > 2000) {
+            last_complaint_ms = millis();
+            app::logf("[ui] panel blank: %s", locked ? "aircraft gone from table"
+                                                     : "store lock timed out");
+        }
         return;
     }
 
@@ -437,8 +443,108 @@ void drawDetail()
     g_frame.drawString(figures, kCentre, kPanelTop + 120);
 }
 
+/**
+ * On-device settings.
+ *
+ * Deliberately only the things worth setting without a keyboard: the range,
+ * and the address to type into a browser for everything else.
+ */
+void drawSettings()
+{
+    g_frame.fillScreen(kColourBackground);
+
+    g_frame.setTextDatum(textdatum_t::middle_center);
+    g_frame.setFont(&fonts::FreeSansBold12pt7b);
+    g_frame.setTextColor(kColourLabel);
+    g_frame.drawString("SETTINGS", kCentre, 64);
+
+    g_frame.setFont(&fonts::FreeSans9pt7b);
+    g_frame.setTextColor(kColourRingLabel);
+    g_frame.drawString("RANGE", kCentre, 126);
+
+    const uint16_t current = app::settings().radius_nm;
+    for (size_t i = 0; i < app::kRadiusPresetCount; i++) {
+        int32_t x, y, w, h;
+        chipRect(i, x, y, w, h);
+        const bool selected = app::kRadiusPresets[i] == current;
+
+        if (selected) {
+            g_frame.fillRoundRect(x, y, w, h, 10, kColourHome);
+        } else {
+            g_frame.fillRoundRect(x, y, w, h, 10, kColourPanel);
+            g_frame.drawRoundRect(x, y, w, h, 10, kColourPanelEdge);
+        }
+
+        char label[8];
+        snprintf(label, sizeof(label), "%u", (unsigned)app::kRadiusPresets[i]);
+        g_frame.setFont(&fonts::FreeSansBold12pt7b);
+        g_frame.setTextColor(selected ? kColourBackground : kColourLabel);
+        g_frame.drawString(label, x + w / 2, y + h / 2 - 6);
+        g_frame.setFont(&fonts::FreeSans9pt7b);
+        g_frame.setTextColor(selected ? kColourBackground : kColourRingLabel);
+        g_frame.drawString("nm", x + w / 2, y + h / 2 + 14);
+    }
+
+    // Where to go for everything this screen deliberately does not offer.
+    g_frame.setFont(&fonts::FreeSans9pt7b);
+    g_frame.setTextColor(kColourRingLabel);
+    g_frame.drawString("MORE SETTINGS IN A BROWSER", kCentre, 250);
+
+    const char *address = net::wifiAddress();
+    g_frame.setFont(&fonts::FreeSansBold12pt7b);
+    g_frame.setTextColor(kColourHome);
+    g_frame.drawString(address[0] != '\0' ? address : "not connected", kCentre, 282);
+
+    g_frame.setFont(&fonts::FreeSans9pt7b);
+    g_frame.setTextColor(kColourDim);
+    char host[48];
+    snprintf(host, sizeof(host), "%s.local", app::settings().hostname);
+    g_frame.drawString(host, kCentre, 308);
+
+    g_frame.setTextColor(kColourRingLabel);
+    g_frame.drawString(net::wifiNetwork(), kCentre, 332);
+
+    g_frame.fillRoundRect(kCentre - kCloseWidth / 2, kCloseTop, kCloseWidth, kCloseHeight,
+                          12, kColourPanel);
+    g_frame.drawRoundRect(kCentre - kCloseWidth / 2, kCloseTop, kCloseWidth, kCloseHeight,
+                          12, kColourPanelEdge);
+    g_frame.setFont(&fonts::FreeSansBold12pt7b);
+    g_frame.setTextColor(kColourLabel);
+    g_frame.drawString("CLOSE", kCentre, kCloseTop + kCloseHeight / 2);
+}
+
+void handleSettingsTap(int32_t x, int32_t y)
+{
+    for (size_t i = 0; i < app::kRadiusPresetCount; i++) {
+        int32_t cx, cy, w, h;
+        chipRect(i, cx, cy, w, h);
+        if (x >= cx && x <= cx + w && y >= cy && y <= cy + h) {
+            app::Settings &settings = app::settings();
+            if (settings.radius_nm != app::kRadiusPresets[i]) {
+                settings.radius_nm = app::kRadiusPresets[i];
+                settings.saveSoon();
+                net::adsbRefreshNow();
+                g_grid_dirty = true;
+                app::logf("[ui] range %u nm", (unsigned)settings.radius_nm);
+            }
+            return;
+        }
+    }
+
+    if (y >= kCloseTop && y <= kCloseTop + kCloseHeight &&
+        abs(x - kCentre) <= kCloseWidth / 2) {
+        g_view = View::Radar;
+    }
+}
+
 void renderFrame()
 {
+    if (g_view == View::Settings) {
+        drawSettings();
+        g_frame.pushSprite(0, 0);
+        return;
+    }
+
     if (g_grid_dirty) {
         drawGrid();
         g_grid_dirty = false;
@@ -446,26 +552,10 @@ void renderFrame()
     g_grid.pushSprite(&g_frame, 0, 0);
     drawAircraft();
     drawCentre();
-    drawNetworkInfo();
     drawDetail();
     g_frame.pushSprite(0, 0);
 }
 
-void changeRange(int direction)
-{
-    app::Settings &settings = app::settings();
-    const size_t current = app::radiusPresetIndex(settings.radius_nm);
-    int next = constrain((int)current + direction, 0, (int)app::kRadiusPresetCount - 1);
-    if ((size_t)next == current) {
-        return;
-    }
-    settings.radius_nm = app::kRadiusPresets[next];
-    settings.saveSoon();
-    net::adsbRefreshNow();
-    g_grid_dirty = true;               // ring labels changed
-    g_range_hint_until = millis() + 1500;
-    app::logf("[ui] range %u nm", (unsigned)settings.radius_nm);
-}
 
 void handleTouch()
 {
@@ -474,59 +564,60 @@ void handleTouch()
         return;
     }
 
+    if (touch.down) {
+        g_up_since_ms = 0;
+    }
+
     if (touch.down && !g_pressed) {
         g_pressed = true;
+        g_long_fired = false;
+        g_long_cancelled = false;
         g_press_x = touch.x;
         g_press_y = touch.y;
         g_press_ms = millis();
-        const float dx = (float)(touch.x - kCentre);
-        const float dy = (float)(touch.y - kCentre);
-        g_bezel_drag = sqrtf(dx * dx + dy * dy) >= (float)kBezelInner;
-        g_bezel_accumulated = 0.0f;
-        g_bezel_last_angle = atan2f(dx, -dy) * (float)RAD_TO_DEG;
         return;
     }
 
-    if (touch.down && g_pressed && g_bezel_drag) {
-        const float angle = atan2f((float)(touch.x - kCentre), (float)(kCentre - touch.y))
-                            * (float)RAD_TO_DEG;
-        float delta = angle - g_bezel_last_angle;
-        while (delta > 180.0f)  delta -= 360.0f;
-        while (delta < -180.0f) delta += 360.0f;
-        g_bezel_last_angle = angle;
-        g_bezel_accumulated += delta;
-
-        while (g_bezel_accumulated >= kDegreesPerStep) {
-            g_bezel_accumulated -= kDegreesPerStep;
-            changeRange(1);
+    if (touch.down && g_pressed) {
+        if (abs(touch.x - g_press_x) > kLongPressSlopPx ||
+            abs(touch.y - g_press_y) > kLongPressSlopPx) {
+            g_long_cancelled = true;
         }
-        while (g_bezel_accumulated <= -kDegreesPerStep) {
-            g_bezel_accumulated += kDegreesPerStep;
-            changeRange(-1);
+        // Hold anywhere on the radar to open settings. This replaced dragging
+        // the outer ring, which fired range changes - and NVS writes, and feed
+        // requests - by accident.
+        if (!g_long_fired && !g_long_cancelled && g_view == View::Radar &&
+            millis() - g_press_ms >= kLongPressMs) {
+            g_long_fired = true;
+            g_selected_icao = 0;
+            g_view = View::Settings;
         }
         return;
     }
 
     if (!touch.down && g_pressed) {
-        g_pressed = false;
-        if (g_bezel_drag) {
-            g_bezel_drag = false;
+        // Wait for the finger to be convincingly gone before acting.
+        if (g_up_since_ms == 0) {
+            g_up_since_ms = millis();
             return;
         }
+        if (millis() - g_up_since_ms < kReleaseDebounceMs) {
+            return;
+        }
+        g_pressed = false;
+        if (g_long_fired) {
+            return;              // the hold already did something
+        }
+
+        if (g_view == View::Settings) {
+            handleSettingsTap(g_press_x, g_press_y);
+            return;
+        }
+
         // A tap on the open panel dismisses it, without hunting for an
         // aircraft underneath it.
         if (g_selected_icao != 0 && insidePanel(g_press_x, g_press_y)) {
             g_selected_icao = 0;
-            return;
-        }
-
-        // Tapping the home dot summons the network details.
-        const int32_t dx = g_press_x - kCentre;
-        const int32_t dy = g_press_y - kCentre;
-        if (dx * dx + dy * dy <= kCentreTapRadius * kCentreTapRadius) {
-            const bool showing = millis() < kInfoBootMs ||
-                                 (g_info_until != 0 && millis() < g_info_until);
-            g_info_until = showing ? 0 : millis() + kInfoTapMs;
             return;
         }
 

@@ -166,6 +166,21 @@ anyone reconsiders:
 - Reading serial with **DTR asserted pulls GPIO0 low**, which drops the board into download
   mode on the next reset. Read with DTR clear.
 
+### Touch
+
+- **Reject impossible samples, do not clamp them.** The CST820 returns out-of-range
+  coordinates now and then. Clamping turned those into a tap at 479,479 - the bottom-right
+  corner, where a round panel has no glass - and each phantom landed on empty space and
+  cleared the user's selection. `touchRead()` now discards anything off-panel or outside
+  the circle and counts it in `/api/status` as `touch_rejected`.
+- **Debounce the release.** The controller drops samples while a finger is still down, so
+  one tap arrives as release-press-release. The second tap re-hit the same aircraft
+  (toggling it off) or landed on the panel that had just opened underneath. A release only
+  counts after 60 ms of continuous "up".
+- Those two between them explain a range that used to change to 100 nm by itself, and the
+  HTTP 429s that came with it: phantom touches at the screen edge were driving the old
+  range-drag gesture. That gesture is gone; range lives on the settings page.
+
 ### The feed
 
 - **Do not parse straight from the TLS socket.** ArduinoJson treats a read that returns
