@@ -13,8 +13,29 @@ Runs on the **Waveshare ESP32-S3-Touch-LCD-2.1** (ESP32-S3R8, 8 MB octal PSRAM, 
        type and registration, altitude, speed and distance">
 </p>
 
-<p align="center"><em>The radar face, and the panel that opens when you tap an aircraft.
-Drawn at the panel's own 480&times;480 &mdash; this is the interface, not a photograph.</em></p>
+<p align="center"><em>The radar face, and the panel that opens when you tap an aircraft.</em></p>
+
+## What it does
+
+- **North-up polar plot** — range rings, cardinal marks, no map tiles. Aircraft are chevrons
+  pointing along their track, coloured by altitude band, with about five minutes of trail
+  behind them.
+- **Tap an aircraft** for its route: airline, origin and destination, aircraft type,
+  registration, altitude, speed, distance and bearing. Looked up on demand and cached.
+- **Emergency squawks** — 7500, 7600 and 7700 draw red with a ring and are never hidden by
+  any filter.
+- **Range from 5 to 100 nm**, changed on the device with a long press, or from a browser.
+- **Filters** — hide aircraft on the ground, hide anything above a flight level, choose how
+  many aircraft get labels, trails off or selected-only.
+- **Fits your desk** — rotate the compass so north points wherever it really is, and rotate
+  the whole screen in 45&deg; steps so a printed case can put the USB port at the bottom.
+- **Night dimming** on a schedule, with any touch restoring full brightness.
+- **Aviation or metric units** throughout.
+- **Set up from your phone** — the device raises its own Wi-Fi network and serves a setup
+  page with a map to drop a pin on.
+- **Updates over Wi-Fi.** The USB cable is needed exactly once.
+- **Survives a feed going down** — two providers, automatic failover, and a visible stale
+  indicator rather than a frozen picture.
 
 ## Install
 
@@ -39,11 +60,11 @@ Everything after that is over Wi-Fi. The cable is only needed once.
 
 ## Using it
 
-| Gesture | What happens |
-|---|---|
+| Gesture         | What happens                                                                          |
+| --------------- | ------------------------------------------------------------------------------------- |
 | Tap an aircraft | Detail panel: callsign, route, aircraft type, registration, altitude, speed, distance |
-| Tap the panel | Dismiss it |
-| Long press | On-device settings: range, and the address for everything else |
+| Tap the panel   | Dismiss it                                                                            |
+| Long press      | On-device settings: range, and the address for everything else                        |
 
 Blips are coloured by altitude band and point along their track. Trails show roughly five
 minutes of history. Aircraft squawking **7500, 7600 or 7700** are drawn in red with a ring
