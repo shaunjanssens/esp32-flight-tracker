@@ -28,7 +28,8 @@ Runs on the **Waveshare ESP32-S3-Touch-LCD-2.1** (ESP32-S3R8, 8 MB octal PSRAM, 
 - **Filters** — hide aircraft on the ground, hide anything above a flight level, choose how
   many aircraft get labels, trails off or selected-only.
 - **Fits your desk** — rotate the compass so north points wherever it really is, and rotate
-  the whole screen in 45&deg; steps so a printed case can put the USB port at the bottom.
+  the whole screen in 45&deg; steps so a printed case can put the USB port at
+  the bottom. There is [one in `case/`](#case).
 - **Night dimming** on a schedule, with any touch restoring full brightness.
 - **Aviation or metric units** throughout.
 - **Set up from your phone** — the device raises its own Wi-Fi network and serves a setup
@@ -99,6 +100,31 @@ Over the air, once it is on your network:
 pio run -e ota -t upload                          # to flighttracker.local
 pio run -e ota -t upload --upload-port 192.168.1.x  # or by address
 ```
+
+## Case
+
+[`case/`](case/) has a printable stand: a plain tube that stands on its own end, bends
+45&deg;, and takes the board in its top face. No screws and no clips — the glass is 75 mm
+and the board 71 mm, so it drops in until the overhang lands on the rim and the bore grips
+the PCB edge. Two notches in the rim clear the connectors that stand proud of the board.
+
+| File | |
+|---|---|
+| [`case/ring.stl`](case/ring.stl) | Fit test — the real bore and the real notches, about ten minutes of printing. |
+| [`case/holder.stl`](case/holder.stl) | The stand itself. |
+| [`case/holder.scad`](case/holder.scad) | Source. Every measurement is a named variable at the top. |
+
+**Print the ring first.** It tells you whether the press fit is right before you commit
+hours to the full part. Too tight or too loose, change `clear` in `holder.scad` and
+re-render:
+
+```bash
+openscad -D 'part="ring"' -o case/ring.stl case/holder.scad   # fit test
+openscad -o case/holder.stl case/holder.scad                  # the stand
+```
+
+The board can go in whichever way round suits your cable; the display rotation setting
+squares the picture back up in 45&deg; steps.
 
 ## Building from source
 
