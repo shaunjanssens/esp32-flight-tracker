@@ -277,6 +277,68 @@ void appendDisplayFields(String &html)
     html += F("</fieldset>");
 }
 
+/** SSIDs are user-chosen text and land inside single-quoted attributes. */
+void appendEscaped(String &html, const String &text)
+{
+    for (size_t i = 0; i < text.length(); i++) {
+        const char c = text[i];
+        switch (c) {
+        case '&':  html += F("&amp;");  break;
+        case '<':  html += F("&lt;");   break;
+        case '\'': html += F("&#39;");  break;
+        default:   html += c;           break;
+        }
+    }
+}
+
+/**
+ * A real <select>, not a <datalist>: iOS Safari does not implement datalist at
+ * all, so the picker was invisible on exactly the phone most people set this up
+ * from. The text input below stays the field that is posted, so hidden networks
+ * and a mistyped scan result are both still enterable; the select only fills it.
+ */
+void appendNetworkPicker(String &html)
+{
+    const int found = WiFi.scanComplete();
+
+    html += F("<label for=netsel>Network</label>"
+              "<select id=netsel onchange=\"if(this.value)"
+              "document.getElementById('ssid').value=this.value\">");
+    html += found > 0 ? F("<option value=''>Pick a network</option>")
+                      : F("<option value=''>No networks found yet - reload</option>");
+
+    for (int i = 0; i < found; i++) {
+        const String ssid = WiFi.SSID(i);
+        if (ssid.isEmpty()) {
+            continue;              // hidden network: nothing to show, type it below
+        }
+        bool seen = false;         // the same AP answers on several bands/radios
+        for (int j = 0; j < i && !seen; j++) {
+            seen = WiFi.SSID(j) == ssid;
+        }
+        if (seen) {
+            continue;
+        }
+        html += F("<option value='");
+        appendEscaped(html, ssid);
+        html += F("'>");
+        appendEscaped(html, ssid);
+        html += F(" (");
+        html += String(WiFi.RSSI(i));
+        html += F(" dBm)</option>");
+    }
+    html += F("</select><label for=ssid>Network name</label><input id=ssid name=ssid value='");
+    appendEscaped(html, WiFi.SSID());
+    html += F("'>");
+
+    // Nothing to show means the scan was clobbered or has gone stale; kick a
+    // fresh async one so a reload has a list. Scanning hops channels and the AP
+    // blinks out while it does, so only when there is nothing to offer.
+    if (found <= 0) {
+        WiFi.scanNetworks(true);
+    }
+}
+
 void appendSettingsFields(String &html)
 {
     appendPositionFields(html);
@@ -291,18 +353,9 @@ void handleSetupPage()
     html += FPSTR(kPageStyle);
     html += F("</head><body><main><h1>Flight Tracker</h1>"
               "<p class=sub>First-time setup</p><form method=POST action=/save>"
-              "<fieldset><legend>Wi-Fi</legend><label for=ssid>Network</label>"
-              "<input id=ssid name=ssid list=nets value='");
-    html += WiFi.SSID();
-    html += F("'><datalist id=nets>");
-
-    const int found = WiFi.scanComplete();
-    for (int i = 0; i < found; i++) {
-        html += F("<option value='");
-        html += WiFi.SSID(i);
-        html += F("'>");
-    }
-    html += F("</datalist><label for=pass>Password</label>"
+              "<fieldset><legend>Wi-Fi</legend>");
+    appendNetworkPicker(html);
+    html += F("<label for=pass>Password</label>"
               "<input id=pass name=pass type=password>"
               "<p class=hint>2.4 GHz only - the ESP32-S3 has no 5 GHz radio.</p>"
               "</fieldset>"
@@ -547,6 +600,10 @@ void startPortal()
     strlcpy(g_address, WiFi.softAPIP().toString().c_str(), sizeof(g_address));
 
     app::logf("[wifi] setup portal up: %s -> http://%s/", ap_name, g_address);
+
+    // After softAP(), never before - bringing the AP up pins the channel and
+    // aborts any scan in flight, which is how the picker ended up always empty.
+    WiFi.scanNetworks(true);
 }
 
 void startOta()
@@ -641,8 +698,6 @@ void networkTask(void *)
 
 bool wifiBegin()
 {
-    WiFi.scanNetworks(true);       // async scan, results feed the portal's picker
-
     if (!connectStation()) {
         startPortal();
     }
